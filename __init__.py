@@ -16,6 +16,5 @@ from daemon.proxy import create_proxy
 from daemon.streaprous import StreapRous
 from daemon.response import Response
 from daemon.request import Request
-from daemon.backend import create_backend
 from daemon.httpadapter import HttpAdapter
 from daemon.dictionary import CaseInsensitiveDict
