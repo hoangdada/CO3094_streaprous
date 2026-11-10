@@ -1,2 +1,5 @@
-CO3094_assignment_streaprous.pdf
-/theory
+/info
+/.agents
+
+__pycache__/
+python-learn
