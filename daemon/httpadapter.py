@@ -27,6 +27,7 @@ from .dictionary import CaseInsensitiveDict
 import asyncio
 import inspect
 import time
+import json
 
 # Import streaprous raw connection functions
 from streaprous_socket.streaprous_raw_connection import (
@@ -98,6 +99,61 @@ class HttpAdapter:
         self.conn_info = None
         #: raw socket for streaprous communication
         self.raw_socket = None
+        
+    def make_json_response(self, data, status=200):
+        body = json.dumps(data).encode("utf-8")
+        reasons = {
+            200: "OK",
+            400: "Bad Request",
+            404: "Not Found",
+            500: "Internal Server Error"
+        }
+        
+        reasons = reasons.get(status, "OK")
+        
+        headers = (
+            f"HTTP/1.1 {status} {reason}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        )
+        
+        return headers.encode("utf-8") + body
+    
+    def handle_route(self, req):
+        try:
+            if req.method is None:
+                return self.make_json_response(
+                    {"error": "Invalid HTTP request"}, 400
+                )
+            
+            if not req.hook:
+                return self.make_json_response(
+                    {"error": "Route not found"}, 404
+                )
+                
+            if inspect.isawaitable(result):
+                result = asyncio.run(result)
+                
+            if isinstance(result, bytes):
+                result = result.decode("utf-8")
+            
+            if isinstance(result, str):
+                result = json.loads(result)
+                
+            return self.make_json_response(result)
+        
+        except (json.JSONDecodeError, ValueError) as e:
+            return self.make_json_response(
+                {"error": str(e)}, 400
+            )
+            
+        except Exception as e:
+            print("[HttpAdapter] Error:", e)
+            return self.make_json_response(
+                {"error": "Internal server error"}, 500
+            )
 
     def handle_client(self, conn, addr, routes):
         """
@@ -133,7 +189,8 @@ class HttpAdapter:
                 #
                 # TODO: handle for App hook here
                 #
-                response = b""
+                response = self.handle_route(req)
+                
             else:
                 # Build response
                 response = resp.build_response(req)
@@ -180,7 +237,7 @@ class HttpAdapter:
             #
             # TODO: handle for App hook here
             #
-            response = ""
+            response = self.handle_route(req)
         else:
             # Build response - returns bytes
             response = resp.build_response(req)
@@ -191,6 +248,7 @@ class HttpAdapter:
         #
         # TODO run_conn_send packet
         # run_conn_send(..)
+        run_conn_send(raw_socket, conn_info, response)
         
         # Wait longer to ensure response is transmitted, client processes it, and sends ACK
         import time
@@ -200,6 +258,7 @@ class HttpAdapter:
         #
         # TODO run_conn_send packet
         # close_connection(...)
+        close_connection(raw_socket, conn_info)
 
     async def handle_client_coroutine(self, reader, writer):
         """
