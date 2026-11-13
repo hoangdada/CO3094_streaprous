@@ -118,11 +118,10 @@ class Request():
         # and self.prepare_headers(self._raw_headers)
         #
 
-        # self._raw_headers = ... 
-        # self._raw_body =...
-        # self.headers = ...
-        
-        self.prepare_headers(self._raw_headers)
+        self._raw_headers, self._raw_body = self.fetch_headers_body(request)
+        self.headers = self.prepare_headers(self._raw_headers)
+        self.body = self._raw_body
+
         print("[Request] Parsed headers: {}".format(self.headers))
 
         #
@@ -132,7 +131,8 @@ class Request():
         # TODO manage the webapp hook in this mounting point
         #
         
-        if not routes == {}:
+        
+        if routes:
             self.routes = routes
             print("[Request] Routing METHOD {} path {}".format(self.method, self.path))
             self.hook = routes.get((self.method, self.path))
