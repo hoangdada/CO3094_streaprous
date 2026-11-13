@@ -45,7 +45,6 @@ class Request():
         "_raw_body",
         "reason",
         "cookies",
-        "body",
         "routes",
         "hook",
     ]
@@ -56,7 +55,7 @@ class Request():
         #: HTTP URL to send the request to.
         self.url = None
         #: dictionary of HTTP headers.
-        self.headers = None
+        self.headers = CaseInsensitiveDict()
         #: HTTP path
         self.path = None        
         # The cookies set used to create Cookie header
@@ -81,7 +80,7 @@ class Request():
             if path == '/':
                 path = '/index.html'
         except Exception:
-            return None, None
+            return None, None, None
 
         return method, path, version
              
@@ -89,10 +88,12 @@ class Request():
         """Prepares the given HTTP headers."""
         lines = request.split('\r\n')
         headers = {}
+
         for line in lines[1:]:
             if ': ' in line:
                 key, val = line.split(': ', 1)
                 headers[key.lower()] = val
+
         return headers
 
     def fetch_headers_body(self, request):
@@ -112,68 +113,48 @@ class Request():
         self.method, self.path, self.version = self.extract_request_line(request)
         print("[Request] {} path {} version {}".format(self.method, self.path, self.version))
 
-        #
-        # TODO:  Parse headers and body 
-        # with self.fetch_headers_body(request)
-        # and self.prepare_headers(self._raw_headers)
-        #
-
-        # self._raw_headers = ... 
-        # self._raw_body =...
-        # self.headers = ...
-        
-        self.prepare_headers(self._raw_headers)
+        self._raw_headers, self._raw_body = self.fetch_headers_body(request)
+            
+        self.headers = self.prepare_headers(self._raw_headers)
         print("[Request] Parsed headers: {}".format(self.headers))
 
-        #
-        # @bksysnet Preapring the webapp hook with StreapRous instance
-        # The default behaviour with HTTP server is empty routed
-        #
-        # TODO manage the webapp hook in this mounting point
-        #
+        self.body = self._raw_body
+
+        # Parse incoming cookies
+        raw_cookies = self.headers.get("cookie", "")
+        self.prepare_cookies(raw_cookies)
         
         if not routes == {}:
             self.routes = routes
             print("[Request] Routing METHOD {} path {}".format(self.method, self.path))
             self.hook = routes.get((self.method, self.path))
             print("[Request] Hook has request {}".format(request))
-            #
-            # self.hook manipulation goes here
-            # ...
-            #
 
-        cookies = self.headers.get('cookie', '')
-            #
-            #  TODO: implement the cookie function here
-            #        by parsing the header            #
+            if self.hook:
+                print("[Request] Matched route: METHOD {} path {}".format(self.method, self.path))
+            else: 
+                print("[Request] No app hook for {} {}".format(self.method, self.path))
 
-        return
-
-    def prepare_body(self, data, files, json=None):
-        self.prepare_content_length(self.body)
-        self.body = body
-        #
-        # TODO prepare the request authentication
-        #
-	# self.auth = ...
-        return
-
-
-    def prepare_content_length(self, body):
-        self.headers["Content-Length"] = "0"
-        #
-        # TODO prepare the request authentication
-        #
-	# self.auth = ...
-        return
-
-
-    def prepare_auth(self, auth, url=""):
-        #
-        # TODO prepare the request authentication
-        #
-	# self.auth = ...
         return
 
     def prepare_cookies(self, cookies):
-            self.headers["Cookie"] = cookies
+        self.cookies = {}
+        if not cookies:
+            return
+
+        pairs = cookies.spliy(";")
+        for pair in pairs:
+            pair = pair.strip()
+
+            if "=" not in pair:
+                continue
+
+            key, value = pair.split("=", 1)
+
+            key = key.strip()
+            value = value.strip()
+
+            if key:
+                self.cookies[key] = value
+
+        return
