@@ -99,61 +99,123 @@ class HttpAdapter:
         self.conn_info = None
         #: raw socket for streaprous communication
         self.raw_socket = None
-        
-    def make_json_response(self, data, status=200):
-        body = json.dumps(data).encode("utf-8")
+    
+    
+    def make_json_response(self, data, status=200, extra_headers=None):
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+
         reasons = {
             200: "OK",
             400: "Bad Request",
+            401: "Unauthorized",
             404: "Not Found",
-            500: "Internal Server Error"
+            500: "Internal Server Error",
+            502: "Bad Gateway"
         }
-        
-        reasons = reasons.get(status, "OK")
-        
+
+        reason = reasons.get(status, "OK")
+
         headers = (
             f"HTTP/1.1 {status} {reason}\r\n"
-            "Content-Type: application/json\r\n"
+            "Content-Type: application/json; charset=utf-8\r\n"
             f"Content-Length: {len(body)}\r\n"
+            "Cache-Control: no-cache\r\n"
             "Connection: close\r\n"
-            "\r\n"
         )
-        
+
+        if extra_headers:
+            for key, value in extra_headers.items():
+                headers += f"{key}: {value}\r\n"
+
+        headers += "\r\n"
         return headers.encode("utf-8") + body
-    
+
+
+
+    def format_route_result(self, result):
+        if isinstance(result, bytes):
+            result = result.decode("utf-8")
+
+        if isinstance(result, str):
+            result = json.loads(result)
+
+        if isinstance(result, dict) and result.get("_http_response"):
+            headers = {}
+
+            if result.get("set_cookie"):
+                headers["Set-Cookie"] = result["set_cookie"]
+
+            return self.make_json_response(
+                result.get("data", {}),
+                result.get("status_code", 200),
+                headers
+            )
+
+        return self.make_json_response(result)
+
+
     def handle_route(self, req):
         try:
-            if req.method is None:
-                return self.make_json_response(
-                    {"error": "Invalid HTTP request"}, 400
-                )
-            
-            if not req.hook:
-                return self.make_json_response(
-                    {"error": "Route not found"}, 404
-                )
-                
+            result = req.hook(req.headers, req.body)
+
             if inspect.isawaitable(result):
                 result = asyncio.run(result)
-                
-            if isinstance(result, bytes):
-                result = result.decode("utf-8")
-            
-            if isinstance(result, str):
-                result = json.loads(result)
-                
-            return self.make_json_response(result)
-        
-        except (json.JSONDecodeError, ValueError) as e:
+
+            return self.format_route_result(result)
+
+        except (json.JSONDecodeError, ValueError, KeyError, TypeError) as e:
             return self.make_json_response(
-                {"error": str(e)}, 400
+                {"status": "error", "message": str(e)}, 400
             )
-            
+
+        except NotImplementedError:
+            return self.make_json_response(
+                {"status": "error", "message": "P2P transport is not ready"}, 502
+            )
+
+        except (OSError, ConnectionError) as e:
+            return self.make_json_response(
+                {"status": "error", "message": str(e)}, 502
+            )
+
         except Exception as e:
             print("[HttpAdapter] Error:", e)
             return self.make_json_response(
-                {"error": "Internal server error"}, 500
+                {"status": "error", "message": "Internal server error"}, 500
             )
+
+
+    async def handle_route_async(self, req):
+        try:
+            result = req.hook(req.headers, req.body)
+
+            if inspect.isawaitable(result):
+                result = await result
+
+            return self.format_route_result(result)
+
+        except (json.JSONDecodeError, ValueError, KeyError, TypeError) as e:
+            return self.make_json_response(
+                {"status": "error", "message": str(e)}, 400
+            )
+
+        except NotImplementedError:
+            return self.make_json_response(
+                {"status": "error", "message": "P2P transport is not ready"}, 502
+            )
+
+        except (OSError, ConnectionError) as e:
+            return self.make_json_response(
+                {"status": "error", "message": str(e)}, 502
+            )
+
+        except Exception as e:
+            print("[HttpAdapter] Error:", e)
+            return self.make_json_response(
+                {"status": "error", "message": "Internal server error"}, 500
+            )
+
+
 
     def handle_client(self, conn, addr, routes):
         """
@@ -196,7 +258,7 @@ class HttpAdapter:
                 response = resp.build_response(req)
         except Exception as e:
             print("[HttpAdapter] Error building response: {}".format(e))
-            response = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"
+            response = resp.build_json_response({"status": "error", "message": "Internal server error"}, 500)
 
         #print("[HttpAdapter] Response content {}".format(response))
         conn.sendall(response)
@@ -248,17 +310,20 @@ class HttpAdapter:
         #
         # TODO run_conn_send packet
         # run_conn_send(..)
-        run_conn_send(raw_socket, conn_info, response)
+        try:
+            run_conn_send(raw_socket, conn_info, response)
         
-        # Wait longer to ensure response is transmitted, client processes it, and sends ACK
-        import time
-        time.sleep(5.0)
+        # # Wait longer to ensure response is transmitted, client processes it, and sends ACK
+        # import time
+        # time.sleep(5.0)
         
         # Close connection with FIN packet
         #
         # TODO run_conn_send packet
         # close_connection(...)
-        close_connection(raw_socket, conn_info)
+        
+        finally:
+            close_connection(raw_socket, conn_info)
 
     async def handle_client_coroutine(self, reader, writer):
         """
@@ -291,15 +356,29 @@ class HttpAdapter:
             #
             # TODO: handle for App hook here
             #
-            response = ""
-
-        # Build response
-        #print("[HttpAdapter] Start **ASYNC** build_response with type {}".format(type(req)))
-        response = resp.build_response(req)
+            try:
+                result = req.hook(req.headers, req.body)
+                
+                if inspect.isawaitable(result):
+                    result = await result
+            
+                response = resp.build_json_response(result)
+            
+            except Exception as e:
+                print("[HttpAdapter] Error:", e)
+                response = resp.build_json_response(
+                    {"status": "error", "message": "Internal server error"}, 500
+                )
+        else:
+            # Build response
+            #print("[HttpAdapter] Start **ASYNC** build_response with type {}".format(type(req)))
+            response = resp.build_response(req)
 
         # Send all the response asynchronously
         writer.write(response)
         await writer.drain()
+        writer.close()
+        await writer.wait_closed()
 
     @property
     def extract_cookies(self, req, resp):

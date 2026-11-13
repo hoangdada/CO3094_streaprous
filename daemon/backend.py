@@ -131,7 +131,7 @@ def handle_client_raw(server, conn_info, routes):
 
 
 # Coroutine async/await for handling new client
-async def handle_client_coroutine(reader, writer):
+async def handle_client_coroutine(reader, writer, routes):
     """
     Coroutine in async communication to initialize connection instance
     then delegates the client handling logic to it.
@@ -143,9 +143,8 @@ async def handle_client_coroutine(reader, writer):
     print("[Backend] Invoke handle_client_coroutine accepted connection from {}".format(addr))
 
     # Handle client in asynchronous mode
-    while True:
-        daemon = HttpAdapter(None, None, None, None, None)
-        await daemon.handle_client_coroutine(reader, writer)
+    daemon = HttpAdapter(None, None, None, addr, routes)
+    await daemon.handle_client_coroutine(reader, writer)
 
 async def async_server(ip="0.0.0.0", port=7000, routes={}):
     print("[Backend] async_server **ASYNC** listening on port {}".format(port))
@@ -157,10 +156,14 @@ async def async_server(ip="0.0.0.0", port=7000, routes={}):
                isCoFunc += "**ASYNC** "
             print("   + ('{}', '{}'): {}{}".format(key[0], key[1], isCoFunc, str(value)))
 
-    async_server = await asyncio.start_server(handle_client_coroutine, ip, port)
-    async with async_server:
-        await async_server.serve_forever()
-    return
+   
+    async def client_handler(reader, writer):
+        await handle_client_coroutine(reader, writer, routes)
+
+    server = await asyncio.start_server(client_handler, ip, port)
+
+    async with server:
+        await server.serve_forever()
 
 
 def run_backend(ip, port, routes, interface=None):
