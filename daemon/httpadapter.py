@@ -188,6 +188,7 @@ class HttpAdapter:
         # Send response using streaprous raw connection
         response = response if isinstance(response, bytes) else response.encode("utf-8")
         print(f"[HttpAdapter] HTTP Response ({len(response)} bytes): {response[:200]}")
+
         #
         # TODO run_conn_send packet
         # run_conn_send(..)
@@ -200,6 +201,14 @@ class HttpAdapter:
         #
         # TODO run_conn_send packet
         # close_connection(...)
+
+        bytes_sent = run_conn_send(raw_socket, conn_info, response)
+        if bytes_sent != len(response):
+            print(
+                f"[HttpAdapter] Failed to send complete response "
+                f"({bytes_sent}/{len(response)} bytes)"
+            )
+        close_connection(raw_socket, conn_info)
 
     async def handle_client_coroutine(self, reader, writer):
         """

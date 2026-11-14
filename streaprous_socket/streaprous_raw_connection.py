@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 import queue
+from typing import Dict, List, Tuple
 from collections import namedtuple
 import netifaces
 
@@ -70,6 +71,67 @@ handshake_in_progress = {}
 DEFAULT_LISTEN_IP = "0.0.0.0"
 DEFAULT_LISTEN_PORT = 22239
 DEFAULT_INTERFACE_NAME = "lo0"
+
+SELECTIVE_REPEAT_MSS = 1024
+SELECTIVE_REPEAT_WINDOW_SIZE = 4
+SELECTIVE_REPEAT_TIMEOUT = 0.5
+SELECTIVE_REPEAT_MAX_RETRIES = 5
+# Receive window must match the window advertised in our TCP headers (5840),
+# otherwise a legitimate peer segment inside the advertised window is refused.
+SELECTIVE_REPEAT_RECV_WINDOW = 5840
+MAX_SACK_BLOCKS = 4
+
+_SEQ_MOD = 1 << 32
+
+# Out-of-order data received per connection, indexed by its TCP sequence number.
+_out_of_order_segments: Dict[Tuple[str, int], Dict[int, bytes]] = {}
+_sack_enabled: Dict[Tuple[str, int], bool] = {}
+_out_of_order_segments_lock = threading.Lock()
+
+
+def _seq_add(seq: int, n: int) -> int:
+    """Add n to a 32-bit TCP sequence number with wrap-around."""
+    return (seq + n) % _SEQ_MOD
+
+
+def _seq_diff(a: int, b: int) -> int:
+    """Signed distance a - b between two 32-bit sequence numbers."""
+    d = (a - b) % _SEQ_MOD
+    return d - _SEQ_MOD if d >= _SEQ_MOD // 2 else d
+
+
+def _seq_lt(a: int, b: int) -> bool:
+    return _seq_diff(a, b) < 0
+
+
+def _seq_leq(a: int, b: int) -> bool:
+    return _seq_diff(a, b) <= 0
+
+
+def _build_sack_option(buffered: Dict[int, bytes], rcv_next: int) -> bytes:
+    """Build a TCP SACK option from buffered out-of-order segments.
+
+    Adjacent segments are merged into one block, blocks are ordered by
+    sequence number and at most MAX_SACK_BLOCKS are reported.
+    """
+    if not buffered:
+        return b""
+    ranges = sorted(
+        ((seq, _seq_add(seq, len(data))) for seq, data in buffered.items()),
+        key=lambda r: _seq_diff(r[0], rcv_next),
+    )
+    merged = [list(ranges[0])]
+    for start, end in ranges[1:]:
+        if _seq_leq(start, merged[-1][1]):
+            if _seq_lt(merged[-1][1], end):
+                merged[-1][1] = end
+        else:
+            merged.append([start, end])
+    merged = merged[:MAX_SACK_BLOCKS]
+    return bytes((5, 2 + 8 * len(merged))) + b"".join(
+        struct.pack("!LL", start, end) for start, end in merged
+    )
+
 
 def register_keep_port_alive(listen_ip="0.0.0.0", listen_port=22239, retry_interval=10):
     """
@@ -141,8 +203,11 @@ def checksum(msg):
     return ~s & 0xffff
 
 
-def build_tcp_packet(src_ip, dest_ip, src_port, dst_port, seq, ack_seq, syn=0, ack=0, fin=0):
-    """Stitches a structurally flawless 20-byte TCP header.
+def build_tcp_packet(
+    src_ip, dest_ip, src_port, dst_port, seq, ack_seq, syn=0, ack=0, fin=0,
+    tcp_options=b""
+):
+    """Build a TCP header, optionally including padded TCP options.
 
     Args:
          src_ip    Source IP address
@@ -154,9 +219,14 @@ def build_tcp_packet(src_ip, dest_ip, src_port, dst_port, seq, ack_seq, syn=0, a
          syn=0     SYN flag
          ack=0     ACK flag
          fin=0     FIN flag
+         tcp_options=b""  TCP options
     """
     flags = (ack << 4) + (syn << 1) + fin
-    offset_res = (5 << 4) + 0  # 20 bytes data offset (5 * 4)
+    tcp_options = bytes(tcp_options)
+    if len(tcp_options) > 40:
+        raise ValueError("TCP options cannot exceed 40 bytes")
+    tcp_options += b"\x01" * (-len(tcp_options) % 4)
+    offset_res = ((5 + len(tcp_options) // 4) << 4)
     window = 5840
     urg_ptr = 0
     draft_checksum = 0
@@ -165,7 +235,7 @@ def build_tcp_packet(src_ip, dest_ip, src_port, dst_port, seq, ack_seq, syn=0, a
     tcp_header_temp = struct.pack('!HHLLBBHHH',
         src_port, dst_port, seq, ack_seq,
         offset_res, flags, window, draft_checksum, urg_ptr
-    )
+    ) + tcp_options
     
     # Build addressing-header
     address_header = struct.pack('!4s4sBBH',
@@ -180,9 +250,46 @@ def build_tcp_packet(src_ip, dest_ip, src_port, dst_port, seq, ack_seq, syn=0, a
     tcp_header = struct.pack('!HHLLBBHHH',
         src_port, dst_port, seq, ack_seq,
         offset_res, flags, window, tcp_checksum, urg_ptr
-    )
+    ) + tcp_options
     
     return tcp_header
+
+
+def _tcp_options(tcp_packet: bytes) -> List[Tuple[int, bytes]]:
+    """Return parsed TCP options, ignoring malformed option sequences."""
+    header_len = ((tcp_packet[12] >> 4) & 0x0F) * 4
+    if header_len < 20 or header_len > len(tcp_packet):
+        return []
+
+    options = []
+    raw_options = tcp_packet[20:header_len]
+    offset = 0
+    while offset < len(raw_options):
+        kind = raw_options[offset]
+        if kind == 0:
+            break
+        if kind == 1:
+            offset += 1
+            continue
+        if offset + 2 > len(raw_options):
+            return []
+        option_len = raw_options[offset + 1]
+        if option_len < 2 or offset + option_len > len(raw_options):
+            return []
+        options.append((kind, raw_options[offset + 2:offset + option_len]))
+        offset += option_len
+    return options
+
+
+def _tcp_sack_blocks(tcp_packet: bytes) -> List[Tuple[int, int]]:
+    blocks = []
+    for kind, value in _tcp_options(tcp_packet):
+        if kind == 5 and len(value) % 8 == 0:
+            blocks.extend(
+                struct.unpack("!LL", value[offset:offset + 8])
+                for offset in range(0, len(value), 8)
+            )
+    return blocks
 
 
 def build_ip_header(src_ip, dest_ip, protocol, payload_len):
@@ -301,6 +408,9 @@ def clean_expired_connections(timeout=60):
             for k in expired:
                 print(f"[Streap_raw] clean_expired_connections: Session [{k[0]}:{k[1]}] Connection timed out ({timeout}s inactivity). Remove connection.")
                 del connections[k]
+                with _out_of_order_segments_lock:
+                    _out_of_order_segments.pop(k, None)
+                    _sack_enabled.pop(k, None)
 
 
 def create_raw_socket() -> socket.socket:
@@ -462,6 +572,12 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
             # STEP 1: Obtain client SYN 
             if syn_flag == 1 and ack_flag == 0:
                 print(f"\nHandshake1: Received SYN from Client ({client_ip}:{client_port}) (Seq={pkt_seq})")
+                sack_permitted = any(
+                    kind == 4 and len(value) == 0
+                    for kind, value in _tcp_options(tcp_packet)
+                )
+                with _out_of_order_segments_lock:
+                    _sack_enabled[client_key] = sack_permitted
 
                 # Quick duplicate handshake check (fast, no heavy operations)
                 with handshake_lock:
@@ -473,8 +589,10 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                 # STEP 2: Reply SYN-ACK immediately
                 # Build TCP packet for SYN-ACK
                 next_ack = pkt_seq + 1
+                syn_options = b"\x04\x02" if sack_permitted else b""
                 syn_ack_packet = build_tcp_packet(send_ip, client_ip, listen_port, client_port,
-                                                  seq=server_seq, ack_seq=next_ack, syn=1, ack=1)
+                                                  seq=server_seq, ack_seq=next_ack, syn=1, ack=1,
+                                                  tcp_options=syn_options)
                 ip_header = build_ip_header(send_ip, client_ip, socket.IPPROTO_TCP, len(syn_ack_packet))
                 full_packet = ip_header + syn_ack_packet
 
@@ -571,6 +689,9 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                 remove_packet_queue(client_key)
                 with connections_lock:
                     connections.pop(client_key, None)
+                with _out_of_order_segments_lock:
+                    _out_of_order_segments.pop(client_key, None)
+                    _sack_enabled.pop(client_key, None)
                 continue
 
             # STEP 3 Exception handling: Capture FIN ACK on SYN queue ---
@@ -696,6 +817,9 @@ def run_conn_recv(s: socket.socket, conn_info: conn_struct) -> bytes:
                 with connections_lock:
                     if client_key in connections:
                         del connections[client_key]
+                with _out_of_order_segments_lock:
+                    _out_of_order_segments.pop(client_key, None)
+                    _sack_enabled.pop(client_key, None)
                 # Clean up packet queue
                 remove_packet_queue(client_key)
                 return b""
@@ -706,6 +830,9 @@ def run_conn_recv(s: socket.socket, conn_info: conn_struct) -> bytes:
                 with connections_lock:
                     if client_key in connections:
                         del connections[client_key]
+                with _out_of_order_segments_lock:
+                    _out_of_order_segments.pop(client_key, None)
+                    _sack_enabled.pop(client_key, None)
                 # Clean up packet queue
                 remove_packet_queue(client_key)
                 return b""
@@ -727,35 +854,81 @@ def run_conn_recv(s: socket.socket, conn_info: conn_struct) -> bytes:
                 if len(app_payload) > 0:
                     print(f"[Streap_raw] Received {len(app_payload)} bytes of data from {client_ip}:{client_port}")
                     print(f"[Streap_raw] Received payload: {app_payload[:100]}...")
-                    
-                    # Send ACK for received data IMMEDIATELY (fast path)
-                    next_ack = pkt_seq + len(app_payload)
-                    
+
+                    rcv_next = session.client_seq
+                    next_expected_seq = rcv_next
+                    contiguous_payloads = []
+                    ahead = _seq_diff(pkt_seq, rcv_next)
+
+                    with _out_of_order_segments_lock:
+                        buffered = _out_of_order_segments.setdefault(client_key, {})
+                        if ahead <= 0:
+                            # In-order, or a retransmission that overlaps data we
+                            # already delivered: keep only the new bytes (if any).
+                            overlap = -ahead
+                            if overlap < len(app_payload):
+                                contiguous_payloads.append(app_payload[overlap:])
+                                next_expected_seq = _seq_add(pkt_seq, len(app_payload))
+                        elif ahead + len(app_payload) <= SELECTIVE_REPEAT_RECV_WINDOW:
+                            # Inside the receive window but after a gap: buffer it.
+                            buffered.setdefault(pkt_seq, app_payload)
+
+                        # Drain every buffered segment that is now contiguous and
+                        # discard buffered segments that are fully covered.
+                        if contiguous_payloads:
+                            progressed = True
+                            while progressed:
+                                progressed = False
+                                for b_seq in list(buffered):
+                                    b_data = buffered[b_seq]
+                                    b_end = _seq_add(b_seq, len(b_data))
+                                    if _seq_leq(b_end, next_expected_seq):
+                                        del buffered[b_seq]
+                                    elif _seq_leq(b_seq, next_expected_seq):
+                                        skip = _seq_diff(next_expected_seq, b_seq)
+                                        contiguous_payloads.append(b_data[skip:])
+                                        next_expected_seq = b_end
+                                        del buffered[b_seq]
+                                        progressed = True
+
+                        # Cumulative ACK stays at the first missing byte; SACK reports
+                        # the out-of-order data held beyond the gap.
+                        sack_options = b""
+                        if _sack_enabled.get(client_key, False):
+                            sack_options = _build_sack_option(buffered, next_expected_seq)
+
+                    # Always ACK (also duplicates / out-of-window data) so the sender
+                    # can recover from a lost ACK or learn our receive state.
+                    cumulative_ack = next_expected_seq
                     ack_packet = build_tcp_packet(session.server_ip, client_ip, listen_port, client_port,
-                                                  seq=session.server_seq, ack_seq=next_ack, ack=1)
+                                                  seq=session.server_seq, ack_seq=cumulative_ack, ack=1,
+                                                  tcp_options=sack_options)
                     ip_header = build_ip_header(session.server_ip, client_ip, socket.IPPROTO_TCP, len(ack_packet))
                     s.sendto(ip_header + ack_packet, (client_ip, 0))
-                    print(f"[Streap_raw] Sent ACK for data (Ack={next_ack})")
+                    print(f"[Streap_raw] Sent ACK for data (Ack={cumulative_ack}, SACK={bool(sack_options)})")
                     
-                    # Update sequence numbers AFTER ACK sent
-                    with connections_lock:
-                        if client_key in connections:
-                            connections[client_key] = session._replace(
-                                server_seq=session.server_seq,
-                                client_seq=next_ack,
-                                last_activity=time.time()
-                            )
-                        
-                    # Return the received payload
-                    return app_payload
+                    if contiguous_payloads:
+                        with connections_lock:
+                            if client_key in connections:
+                                connections[client_key] = session._replace(
+                                    server_seq=session.server_seq,
+                                    client_seq=next_expected_seq,
+                                    last_activity=time.time()
+                                )
+
+                        return b"".join(contiguous_payloads)
 
             # Handle pure ACK (no data)
             elif ack_flag and not syn_flag and not psh_flag and not has_data:
                 print(f"[Streap_raw] Received ACK from {client_ip}:{client_port} (Ack={pkt_ack})")
                 with connections_lock:
                     if client_key in connections:
-                        connections[client_key] = session._replace(
-                            server_seq=pkt_ack,
+                        current = connections[client_key]
+                        # Late or duplicate ACKs (common after retransmissions) must
+                        # never move our send sequence number backwards.
+                        new_seq = pkt_ack if _seq_lt(current.server_seq, pkt_ack) else current.server_seq
+                        connections[client_key] = current._replace(
+                            server_seq=new_seq,
                             last_activity=time.time()
                         )
 
@@ -769,7 +942,7 @@ def run_conn_recv(s: socket.socket, conn_info: conn_struct) -> bytes:
 
 def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> int:
     """
-    Send data on an established connection using raw sockets.
+    Send data using a selective-repeat sliding window.
     
     Args:
         s: Raw socket
@@ -791,27 +964,134 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
             return -1
         session = connections[client_key]
     
-    try:
-        bytes_sent = send_tcp_data_segment(
+    if not payload:
+        return 0
+
+    packet_queue = get_packet_queue(client_key)
+    segments: List[bytes] = [
+        payload[offset:offset + SELECTIVE_REPEAT_MSS]
+        for offset in range(0, len(payload), SELECTIVE_REPEAT_MSS)
+    ]
+    # seq -> (segment, last_send_time, retries) for every un-ACKed segment
+    outstanding: Dict[int, Tuple[bytes, float, int]] = {}
+    deferred_packets: List[Tuple[bytes, Tuple[str, int]]] = []
+    next_segment = 0
+    base_seq = session.server_seq
+
+    def transmit(seq: int, segment: bytes, retries: int) -> None:
+        sent = send_tcp_data_segment(
             s, listen_ip, client_ip, listen_port, client_port,
-            seq=session.server_seq, ack_seq=session.client_seq, payload=payload
+            seq=seq, ack_seq=session.client_seq, payload=segment
         )
-        
-        print(f"[Streap_raw] run_conn_send Sent {bytes_sent} bytes to {client_ip}:{client_port}")
-        
-        # Update sequence numbers
+        if sent != len(segment):
+            raise OSError(f"short send: expected {len(segment)} bytes, sent {sent}")
+        outstanding[seq] = (segment, time.monotonic(), retries)
+
+    try:
+        while next_segment < len(segments) or outstanding:
+            # Fill the send window.
+            while (
+                next_segment < len(segments)
+                and len(outstanding) < SELECTIVE_REPEAT_WINDOW_SIZE
+            ):
+                seq = _seq_add(base_seq, next_segment * SELECTIVE_REPEAT_MSS)
+                transmit(seq, segments[next_segment], 0)
+                next_segment += 1
+
+            # Selective repeat: retransmit only the segments whose own timer expired.
+            now = time.monotonic()
+            for seq, state in list(outstanding.items()):
+                if now - state[1] < SELECTIVE_REPEAT_TIMEOUT:
+                    continue
+                if state[2] >= SELECTIVE_REPEAT_MAX_RETRIES:
+                    raise TimeoutError(f"segment at sequence {seq} was not acknowledged")
+                transmit(seq, state[0], state[2] + 1)
+
+            # Sleep only until the earliest timer expires.
+            now = time.monotonic()
+            wait_timeout = max(
+                0.001,
+                min(
+                    SELECTIVE_REPEAT_TIMEOUT - (now - state[1])
+                    for state in outstanding.values()
+                ),
+            )
+            try:
+                packet, addr = packet_queue.get(timeout=wait_timeout)
+            except queue.Empty:
+                continue
+
+            ihl = (packet[0] & 0x0F) * 4
+            if ihl < 20 or len(packet) < ihl + 20:
+                deferred_packets.append((packet, addr))
+                continue
+            tcp_packet = packet[ihl:]
+
+            src_port, dest_port, _, pkt_ack, _, flags, _, _, _ = struct.unpack(
+                "!HHLLBBHHH", tcp_packet[:20]
+            )
+            if src_port != client_port or dest_port != listen_port:
+                deferred_packets.append((packet, addr))
+                continue
+
+            # A reset aborts the transfer; hand the RST back to run_conn_recv so
+            # it can clean the connection up.
+            if flags & 0x04:
+                deferred_packets.append((packet, addr))
+                raise ConnectionResetError("connection reset by peer during send")
+
+            tcp_header_len = ((tcp_packet[12] >> 4) & 0x0F) * 4
+            has_payload = tcp_header_len < len(tcp_packet)
+            is_pure_ack = bool(flags & 0x10) and not (flags & 0x03) and not has_payload
+
+            # Any segment with the ACK flag carries acknowledgement information,
+            # including data segments that piggy-back an ACK.
+            acknowledged_sequences = []
+            if flags & 0x10 and not flags & 0x02:
+                sack_blocks = _tcp_sack_blocks(tcp_packet)
+                for seq, state in outstanding.items():
+                    segment_end = _seq_add(seq, len(state[0]))
+                    if _seq_leq(segment_end, pkt_ack) or any(
+                        _seq_leq(sack_start, seq) and _seq_leq(segment_end, sack_end)
+                        for sack_start, sack_end in sack_blocks
+                    ):
+                        acknowledged_sequences.append(seq)
+            for seq in acknowledged_sequences:
+                del outstanding[seq]
+            if acknowledged_sequences:
+                with connections_lock:
+                    if client_key in connections:
+                        current = connections[client_key]
+                        connections[client_key] = current._replace(
+                            last_activity=time.time()
+                        )
+
+            # Pure ACKs are fully consumed here; anything else (request data, FIN,
+            # ...) belongs to run_conn_recv.
+            if not is_pure_ack:
+                deferred_packets.append((packet, addr))
+
+        bytes_sent = len(payload)
         with connections_lock:
             if client_key in connections:
-                connections[client_key] = session._replace(
-                    server_seq=session.server_seq + bytes_sent,
+                current = connections[client_key]
+                connections[client_key] = current._replace(
+                    server_seq=_seq_add(base_seq, bytes_sent),
                     last_activity=time.time()
                 )
-        
+
+        print(f"[Streap_raw] run_conn_send Sent {bytes_sent} bytes to {client_ip}:{client_port}")
         return bytes_sent
-        
-    except Exception as e:
+
+    except (OSError, TimeoutError, struct.error) as e:
         print(f"[Streap_raw] run_conn_send Error in run_conn_send: {e}")
         return -1
+    finally:
+        for packet, addr in deferred_packets:
+            try:
+                packet_queue.put_nowait((packet, addr))
+            except queue.Full:
+                print(f"[Streap_raw] run_conn_send could not restore a deferred packet")
 
 
 def close_connection(s: socket.socket, conn_info: conn_struct):
@@ -835,9 +1115,15 @@ def close_connection(s: socket.socket, conn_info: conn_struct):
     
     # Clean up packet queue
     remove_packet_queue(client_key)
+    with _out_of_order_segments_lock:
+        _out_of_order_segments.pop(client_key, None)
+        _sack_enabled.pop(client_key, None)
 
 
 def close_all_connections():
     """Close all connections and clean up."""
     with connections_lock:
         connections.clear()
+    with _out_of_order_segments_lock:
+        _out_of_order_segments.clear()
+        _sack_enabled.clear()
