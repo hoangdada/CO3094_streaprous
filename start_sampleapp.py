@@ -28,7 +28,7 @@ import json
 import socket
 import argparse
 
-from apps import create_sampleapp
+from app import create_sampleapp
 
 PORT = 2026  # Default port
 

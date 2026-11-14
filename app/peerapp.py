@@ -19,30 +19,33 @@ def read_body(body):
 
     return data
 
-
-def error(message, status=400):
-    return {
-        "_http_response": True,
-        "status_code": status,
-        "data": {"status": "error", "message": message}
-    }
-
-
 def get_cookie(headers):
     for key, value in (headers or {}).items():
         if key.lower() == "cookie":
             return value
     return None
 
+def json_response(data, status_code=200, headers=None):
+    content = json.dumps(data).encode("utf-8")
+    return headers or {}, status_code, content
+
+def error(message, status=400):
+    return json_response(
+        {"message": message},
+        status_code=status,
+        headers={}
+    )
 
 def tracker_result(result):
-    return {
-        "_http_response": True,
-        "status_code": result["status_code"],
-        "data": result["data"],
-        "set_cookie": result.get("set_cookie")
-    }
+    headers = {}
+    if result.get("set_cookie"):
+        headers["Set-Cookie"] = result["set_cookie"]
 
+    return json_response(
+        result.get("data", {}),
+        status_code=result["status_code"],
+        headers=headers
+    )
 
 def valid_port(port):
     port = int(port)
@@ -53,75 +56,75 @@ def valid_port(port):
 
 # -------- Tracker APIs --------
 
-@app.route('/login/', methods=['POST'])
-def login(headers, body):
+@app.route('/login', methods=['POST'])
+def login(headers, body, client_ip=None):
     global current_user
 
-    data = read_body(body)
-    result = tracker_client.login(
-        data["username"], data["password"]
-    )
+    try:
+        data = read_body(body)
+        username = data["username"]
+        password = data["password"]
+    except ValueError, KeyError:
+        return error("Invalid username or password payload", 400)
+
+    result = tracker_client.login(username, password)
 
     if result["status_code"] == 200:
-        current_user = data["username"]
+        current_user = username
 
     return tracker_result(result)
 
+@app.route('/submit-info', methods=['POST'])
+def submit_info(headers, body, client_ip=None):
+    try:
+        data = read_body(body)
+        port = valid_port(data["port"])
+    except ValueError, KeyError:
+        return error("Invalid port", 400)
 
-@app.route('/submit-info/', methods=['POST'])
-def submit_info(headers, body):
-    data = read_body(body)
+    result = tracker_client.submit_info(port, get_cookie(headers))
+    return tracker_result(result)
 
-    result = tracker_client.submit_info(
-        data["username"],
-        data["ip"],
-        valid_port(data["port"]),
-        get_cookie(headers)
-    )
+@app.route('/logout', methods=['POST'])
+def logout(headers, body, client_ip=None):
+    global current_user
+
+    result = tracker_client.logout(get_cookie(headers))
+    if result["status_code"] == 200:
+        current_user = None
 
     return tracker_result(result)
 
-
-@app.route('/add-list/', methods=['POST'])
-def add_list(headers, body):
-    data = read_body(body)
-
-    result = tracker_client.add_list(
-        data["username"],
-        data["ip"],
-        valid_port(data["port"]),
-        get_cookie(headers)
-    )
-
-    return tracker_result(result)
-
-
-@app.route('/get-list/', methods=['GET'])
-def get_list(headers, body):
+@app.route('/get-list', methods=['GET'])
+def get_list(headers, body, client_ip=None):
     result = tracker_client.get_list(get_cookie(headers))
 
     if result["status_code"] != 200:
         return tracker_result(result)
 
-    directory = result["data"]
-    peers = directory.get("peers", []) if isinstance(directory, dict) else directory
+    directory = result.get("data", {})
+    raw_peers = directory.get("peers", {}) if isinstance(directory, dict) else directory
 
-    if isinstance(peers, dict):
-        peers = list(peers.values())
+    if isinstance(raw_peers, dict):
+        peers = [
+            {"username": uname, **info}
+            for uname, info in raw_peers.items()
+        ]
+    else:
+        peers = list(raw_peers)
 
     connected = peer.get_connected_peers()
-
     for item in peers:
         item["connected"] = any(
             p["ip"] == item["ip"] and p["port"] == int(item["port"])
             for p in connected
         )
 
-    return {
-        "peers": peers,
-        "messages": peer.drain_inbox_messages()
-    }
+    return json_response({"peers": peers}, 200)
 
+@app.route('/messages', methods=['GET'])
+def get_messages(headers, body, client_ip=None):
+    return json_response({"messages": peer.drain_inbox_messages()}, 200)
 
 # -------- Peer APIs --------
 
