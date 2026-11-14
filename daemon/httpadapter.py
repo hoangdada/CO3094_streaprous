@@ -99,6 +99,35 @@ class HttpAdapter:
         #: raw socket for streaprous communication
         self.raw_socket = None
 
+    def _dispatch_request(self, raw_bytes, routes, client_ip):
+        """
+        Parse the buffered HTTP request, invoke the matched route hook if any,
+        and construct the HTTP response bytes via Request and Response.
+        """
+        req = self.request
+        resp = self.response
+
+        msg = raw_bytes.decode("utf-8")
+        req.prepare(msg, routes)
+
+        if req.hook:
+            response_headers, status_code, content = req.hook(
+                headers=req.headers,
+                body=req.body,
+                client_ip=client_ip
+            )
+
+            response = resp.build_response(
+                req,
+                headers=response_headers,
+                status_code=status_code,
+                content=content
+            )
+        else:
+            response = resp.build_response(req)
+
+        return response if isinstance(response, bytes) else response.encode("utf-8")
+
     def handle_client(self, conn, addr, routes):
         """
         Handle an incoming client connection.
@@ -111,39 +140,35 @@ class HttpAdapter:
         :param addr (tuple): The client's address.
         :param routes (dict): The route mapping for dispatching requests.
         """
-
-        # Connection handler.
         self.conn = conn
-        # Connection address.
         self.connaddr = addr
-        # Request handler
-        req = self.request
-        # Response handler
-        resp = self.response
+        client_ip = addr[0] if addr else None
 
-        # Handle the request
-        msg = conn.recv(1024).decode()
-        req.prepare(msg, routes)
         print("[HttpAdapter] Invoke handle_client connection {}".format(addr))
-
-        # Handle request hook
-        response = b""
+       
         try:
-            if req.hook:
-                #
-                # TODO: handle for App hook here
-                #
-                response = b""
-            else:
-                # Build response
-                response = resp.build_response(req)
+            data = bytearray()
+
+            while True:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    print("[HttpAdapter] Connection closed before request completion")
+                    return
+
+                data.extend(chunk)
+                if is_request_complete(data):
+                    break
+
+            response = self._dispatch_request(data, routes, client_ip)
+
         except Exception as e:
-            print("[HttpAdapter] Error building response: {}".format(e))
+            print("[HttpAdapter] Error handling client {}: {}".format(addr, e))
             response = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"
 
-        #print("[HttpAdapter] Response content {}".format(response))
-        conn.sendall(response)
-        conn.close()
+        try:
+            conn.sendall(response)
+        finally:
+            conn.close()
 
     def handle_client_raw(self, raw_socket, conn_info, routes):
         """
@@ -157,65 +182,44 @@ class HttpAdapter:
         :param conn_info (conn_struct): The connection info for the client.
         :param routes (dict): The route mapping for dispatching requests.
         """
-        # Request handler
-        req = self.request
-        # Response handler
-        resp = self.response
+        self.raw_socket = raw_socket
+        self.conn_info = conn_info
 
         print("[HttpAdapter] Invoke handle_client_raw for {}:{}".format(conn_info.client_ip, conn_info.client_port))
 
-        data = bytearray()
-
-        while True:
-            chunk = run_conn_recv(raw_socket, conn_info)
-
-            if not chunk:
-                print("[HttpAdapter] Connection closed before request completion")
-                return
-
-            data.extend(chunk)
-
-            if is_request_complete(data):
-                break
-
         # Receive data using streaprous raw connection
         # data = run_conn_recv(raw_socket, conn_info)
-        
-        if not data:
-            print("[HttpAdapter] No data received or connection closed")
-            return
 
-        # Prepare request
-        msg = data.decode("utf-8")
-        req.prepare(msg, routes)
-        
-        # Handle request hook
-        if req.hook:
-            response_data = req.hook(
-                headers=req.headers,
-                body=req.body
-            )
+        try:
+            data = bytearray()
 
-            response = resp.build_response(req, response_data)
-        else:
-            # Build response - returns bytes
-            response = resp.build_response(req)
+            while True:
+                chunk = run_conn_recv(raw_socket, conn_info)
+                if not chunk:
+                    print("[HttpAdapter] Connection closed before request completion")
+                    return
+
+                data.extend(chunk)
+                if is_request_complete(data):
+                    break
+
+            response = self._dispatch_request(data, routes, conn_info.client_ip)
+
+        except Exception as e:
+            print("[HttpAdapter] Error handling raw client {}:{}: {}".format(conn_info.client_ip, conn_info.client_port, e))
+            response = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"
         
         # Send response using streaprous raw connection
-        response = response if isinstance(response, bytes) else response.encode("utf-8")
         print(f"[HttpAdapter] HTTP Response ({len(response)} bytes): {response[:200]}")
-        #
-        # TODO run_conn_send packet
-        run_conn_send(raw_socket, conn_info, response)
+
+        try:
+            run_conn_send(raw_socket, conn_info, response)
         
-        # Wait longer to ensure response is transmitted, client processes it, and sends ACK
-        import time
-        time.sleep(5.0)
-        
-        # Close connection with FIN packet
-        #
-        # TODO run_conn_send packet
-        close_connection(raw_socket, conn_info)
+            # Wait longer to ensure response is transmitted, client processes it, and sends ACK
+            import time
+            time.sleep(2.0)
+        finally:
+            close_connection(raw_socket, conn_info)
 
     async def handle_client_coroutine(self, reader, writer):
         """
@@ -285,6 +289,8 @@ def is_request_complete(request_buffer: bytearray) -> bool:
 
         if key.strip().lower() == b"content-length":
             content_length = int(value.strip())
+            if content_length < 0:
+                raise ValueError("Invalid Content-Length header")
             break
 
     # 4. Calculate received body bytes.

@@ -142,7 +142,7 @@ class Request():
         if not cookies:
             return
 
-        pairs = cookies.spliy(";")
+        pairs = cookies.split(";")
         for pair in pairs:
             pair = pair.strip()
 

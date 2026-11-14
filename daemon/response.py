@@ -176,7 +176,7 @@ class Response():
             base_dir = BASE_DIR + "static/"
 
         elif main_type == 'application':
-            base_dir = BASE_DIR + "apps/"
+            base_dir = BASE_DIR + "app/"
 
         else:
             raise ValueError("Unsupported MIME type: {}".format(mime_type))
