@@ -99,6 +99,35 @@ class HttpAdapter:
         #: raw socket for streaprous communication
         self.raw_socket = None
 
+    def _dispatch_request(self, raw_bytes, routes, client_ip):
+        """
+        Parse the buffered HTTP request, invoke the matched route hook if any,
+        and construct the HTTP response bytes via Request and Response.
+        """
+        req = self.request
+        resp = self.response
+
+        msg = raw_bytes.decode("utf-8")
+        req.prepare(msg, routes)
+
+        if req.hook:
+            response_headers, status_code, content = req.hook(
+                headers=req.headers,
+                body=req.body,
+                client_ip=client_ip
+            )
+
+            response = resp.build_response(
+                req,
+                headers=response_headers,
+                status_code=status_code,
+                content=content
+            )
+        else:
+            response = resp.build_response(req)
+
+        return response if isinstance(response, bytes) else response.encode("utf-8")
+
     def handle_client(self, conn, addr, routes):
         """
         Handle an incoming client connection.
@@ -111,39 +140,35 @@ class HttpAdapter:
         :param addr (tuple): The client's address.
         :param routes (dict): The route mapping for dispatching requests.
         """
-
-        # Connection handler.
         self.conn = conn
-        # Connection address.
         self.connaddr = addr
-        # Request handler
-        req = self.request
-        # Response handler
-        resp = self.response
+        client_ip = addr[0] if addr else None
 
-        # Handle the request
-        msg = conn.recv(1024).decode()
-        req.prepare(msg, routes)
         print("[HttpAdapter] Invoke handle_client connection {}".format(addr))
-
-        # Handle request hook
-        response = b""
+       
         try:
-            if req.hook:
-                #
-                # TODO: handle for App hook here
-                #
-                response = b""
-            else:
-                # Build response
-                response = resp.build_response(req)
+            data = bytearray()
+
+            while True:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    print("[HttpAdapter] Connection closed before request completion")
+                    return
+
+                data.extend(chunk)
+                if is_request_complete(data):
+                    break
+
+            response = self._dispatch_request(data, routes, client_ip)
+
         except Exception as e:
-            print("[HttpAdapter] Error building response: {}".format(e))
+            print("[HttpAdapter] Error handling client {}: {}".format(addr, e))
             response = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"
 
-        #print("[HttpAdapter] Response content {}".format(response))
-        conn.sendall(response)
-        conn.close()
+        try:
+            conn.sendall(response)
+        finally:
+            conn.close()
 
     def handle_client_raw(self, raw_socket, conn_info, routes):
         """
@@ -157,49 +182,45 @@ class HttpAdapter:
         :param conn_info (conn_struct): The connection info for the client.
         :param routes (dict): The route mapping for dispatching requests.
         """
-        # Request handler
-        req = self.request
-        # Response handler
-        resp = self.response
+        self.raw_socket = raw_socket
+        self.conn_info = conn_info
 
         print("[HttpAdapter] Invoke handle_client_raw for {}:{}".format(conn_info.client_ip, conn_info.client_port))
 
         # Receive data using streaprous raw connection
-        data = run_conn_recv(raw_socket, conn_info)
-        
-        if not data:
-            print("[HttpAdapter] No data received or connection closed")
-            return
+        # data = run_conn_recv(raw_socket, conn_info)
 
-        # Prepare request
-        msg = data.decode("utf-8")
-        req.prepare(msg, routes)
-        
-        # Handle request hook
-        if req.hook:
-            #
-            # TODO: handle for App hook here
-            #
-            response = ""
-        else:
-            # Build response - returns bytes
-            response = resp.build_response(req)
+        try:
+            data = bytearray()
+
+            while True:
+                chunk = run_conn_recv(raw_socket, conn_info)
+                if not chunk:
+                    print("[HttpAdapter] Connection closed before request completion")
+                    return
+
+                data.extend(chunk)
+                if is_request_complete(data):
+                    break
+
+            response = self._dispatch_request(data, routes, conn_info.client_ip)
+
+        except Exception as e:
+            print("[HttpAdapter] Error handling raw client {}:{}: {}".format(conn_info.client_ip, conn_info.client_port, e))
+            response = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"
         
         # Send response using streaprous raw connection
-        response = response if isinstance(response, bytes) else response.encode("utf-8")
         print(f"[HttpAdapter] HTTP Response ({len(response)} bytes): {response[:200]}")
-        #
-        # TODO run_conn_send packet
-        # run_conn_send(..)
-        
-        # Wait longer to ensure response is transmitted, client processes it, and sends ACK
-        import time
-        time.sleep(5.0)
-        
-        # Close connection with FIN packet
-        #
-        # TODO run_conn_send packet
-        # close_connection(...)
+
+        try:
+            bytes_sent = run_conn_send(raw_socket, conn_info, response)
+            if bytes_sent != len(response):
+                print(
+                    f"[HttpAdapter] Failed to send complete response "
+                    f"({bytes_sent}/{len(response)} bytes)"
+                )
+        finally:
+            close_connection(raw_socket, conn_info)
 
     async def handle_client_coroutine(self, reader, writer):
         """
@@ -242,135 +263,40 @@ class HttpAdapter:
         writer.write(response)
         await writer.drain()
 
-    @property
-    def extract_cookies(self, req, resp):
-        """
-        Build cookies from the :class:`Request <Request>` headers.
+def is_request_complete(request_buffer: bytearray) -> bool:
+    """
+    Check whether a complete HTTP request has been received.
 
-        :param req:(Request) The :class:`Request <Request>` object.
-        :param resp: (Response) The res:class:`Response <Response>` object.
-        :rtype: cookies - A dictionary of cookie key-value pairs.
-        """
-        cookies = {}
-        for header in headers:
-            if header.startswith("Cookie:"):
-                cookie_str = header.split(":", 1)[1].strip()
-                for pair in cookie_str.split(";"):
-                    key, value = pair.strip().split("=")
-                    cookies[key] = value
-        return cookies
+    Supports:
+        - Requests without a body
+        - Requests with Content-Length
+    """
 
-    def build_response(self, req, resp):
-        """Builds a :class:`Response <Response>` object 
+    # 1. Find the end of HTTP headers.
+    header_end = request_buffer.find(b"\r\n\r\n")
 
-        :param req: The :class:`Request <Request>` used to generate the response.
-        :param resp: The  response object.
-        :rtype: Response
-        """
-        response = Response()
+    if header_end == -1:
+        return False
 
-        # Set encoding.
-        response.encoding = get_encoding_from_headers(response.headers)
-        response.raw = resp
-        response.reason = response.raw.reason
+    # 2. Extract headers.
+    header_data = request_buffer[:header_end]
+    content_length = 0
 
-        if isinstance(req.url, bytes):
-            response.url = req.url.decode("utf-8")
-        else:
-            response.url = req.url
+    for line in header_data.split(b"\r\n")[1:]:
+        key, separator, value = line.partition(b":")
 
-        # Add new cookies from the server.
-        response.cookies = extract_cookies(req)
+        if not separator:
+            continue
 
-        # Give the Response some context.
-        response.request = req
-        response.connection = self
+        if key.strip().lower() == b"content-length":
+            content_length = int(value.strip())
+            if content_length < 0:
+                raise ValueError("Invalid Content-Length header")
+            break
 
-        return response
+    # 4. Calculate received body bytes.
+    body_start = header_end + 4
+    received_body_length = len(request_buffer) - body_start
 
-    def build_json_response(self, req, resp):
-        """Builds a :class:`Response <Response>` object from JSON data
-
-        :param req: The :class:`Request <Request>` used to generate the response.
-        :param resp: The  response object.
-        :rtype: Response
-        """
-        response = Response(req)
-
-        # Set encoding.
-        response.raw = resp
-
-        if isinstance(req.url, bytes):
-            response.url = req.url.decode("utf-8")
-        else:
-            response.url = req.url
-
-        # Give the Response some context.
-        response.request = req
-        response.connection = self
-
-        return response
-
-
-    # def get_connection(self, url, proxies=None):
-        # """Returns a url connection for the given URL. 
-
-        # :param url: The URL to connect to.
-        # :param proxies: (optional) A Requests-style dictionary of proxies used on this request.
-        # :rtype: int
-        # """
-
-        # proxy = select_proxy(url, proxies)
-
-        # if proxy:
-            # proxy = prepend_scheme_if_needed(proxy, "http")
-            # proxy_url = parse_url(proxy)
-            # if not proxy_url.host:
-                # raise InvalidProxyURL(
-                    # "Please check proxy URL. It is malformed "
-                    # "and could be missing the host."
-                # )
-            # proxy_manager = self.proxy_manager_for(proxy)
-            # conn = proxy_manager.connection_from_url(url)
-        # else:
-            # # Only scheme should be lower case
-            # parsed = urlparse(url)
-            # url = parsed.geturl()
-            # conn = self.poolmanager.connection_from_url(url)
-
-        # return conn
-
-
-    def add_headers(self, request):
-        """
-        Add headers to the request.
-
-        This method is intended to be overridden by subclasses to inject
-        custom headers. It does nothing by default.
-
-        
-        :param request: :class:`Request <Request>` to add headers to.
-        """
-        pass
-
-    def build_proxy_headers(self, proxy):
-        """Returns a dictionary of the headers to add to any request sent
-        through a proxy. 
-
-        :class:`HttpAdapter <HttpAdapter>`.
-
-        :param proxy: The url of the proxy being used for this request.
-        :rtype: dict
-        """
-        headers = {}
-        #
-        # TODO: build your authentication here
-        #       username, password =...
-        # we provide dummy auth here
-        #
-        username, password = ("user1", "password")
-
-        if username:
-            headers["Proxy-Authorization"] = (username, password)
-
-        return headers
+    # 5. Check completeness.
+    return received_body_length >= content_length
