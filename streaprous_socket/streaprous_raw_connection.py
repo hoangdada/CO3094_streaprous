@@ -141,7 +141,7 @@ def checksum(msg):
     return ~s & 0xffff
 
 
-def build_tcp_packet(src_ip, dest_ip, src_port, dst_port, seq, ack_seq, syn=0, ack=0, fin=0):
+def build_tcp_packet(src_ip, dest_ip, src_port, dst_port, seq, ack_seq, syn=0, ack=0, fin=0, window=None):
     """Stitches a structurally flawless 20-byte TCP header.
 
     Args:
@@ -157,10 +157,10 @@ def build_tcp_packet(src_ip, dest_ip, src_port, dst_port, seq, ack_seq, syn=0, a
     """
     flags = (ack << 4) + (syn << 1) + fin
     offset_res = (5 << 4) + 0  # 20 bytes data offset (5 * 4)
-    window = 5840
+    # window = 5840
     urg_ptr = 0
     draft_checksum = 0
-
+    if window is None: window = RECEIVE_CAP
     # Build a draft (20 byte) header with no checksum
     tcp_header_temp = struct.pack('!HHLLBBHHH',
         src_port, dst_port, seq, ack_seq,
@@ -617,7 +617,7 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
 #some func + const
 #DISCLAIMER!!!!!!!!!!!!!!!: i did intentionally add the ADDED to maintain the code cuz the provided code  and my code living in the same so, that is not AI...
 RECEIVER_IDLE_TIMEOUT = 60
-RECEIVE_CAP = 10 # max
+RECEIVE_CAP = 5840 #flow receive window
 MESSAGE_SIZE = 1000
 SEND_WINDOW = 4 
 RETRANSMISSION_TIMEOUT = 2.0
@@ -631,13 +631,17 @@ def _forget_connection(connection_key):
     remove_packet_queue(connection_key)
 
 def _send_pure_ack(raw_socket, connection_record, ack_number):
+    window = _free_receive_window()
     tcp_header = build_tcp_packet(connection_record.server_ip, connection_record.client_ip, connection_record.server_port, connection_record.client_port, 
-                                  connection_record.server_seq,  ack_seq=ack_number, ack = 1)
+                                  connection_record.server_seq,  ack_seq=ack_number, ack = 1, window=window)
     ip_header = build_ip_header(connection_record.server_ip, connection_record.client_ip, socket.IPPROTO_TCP, len(tcp_header))
     raw_socket.sendto(ip_header + tcp_header, (connection_record.client_ip, 0))
 
 #selective_recv
 _early_segments = {}
+def _free_receive_window():
+    buffered = sum(len(p)   for p in _early_segments.values())
+    return  max(0,RECEIVE_CAP-buffered)
 def run_conn_recv(s: socket.socket, conn_info: conn_struct) -> bytes:
     """
     Receive data on an established connection using raw sockets.
@@ -768,7 +772,7 @@ def run_conn_recv(s: socket.socket, conn_info: conn_struct) -> bytes:
                     expected_seq = session.client_seq
                     bytes_ahead = (pkt_seq - expected_seq) 
                     if bytes_ahead != 0:
-                        if 0 < bytes_ahead < RECEIVE_CAP :
+                        if 0 < bytes_ahead < RECEIVE_CAP - len(app_payload):
                             _early_segments[pkt_seq] = app_payload
                         _send_pure_ack(s, session, expected_seq)
                         idle_deadline = time.time() + RECEIVER_IDLE_TIMEOUT
@@ -784,7 +788,7 @@ def run_conn_recv(s: socket.socket, conn_info: conn_struct) -> bytes:
                         next_ack  += len(buffered_payload)
 
                     ack_packet = build_tcp_packet(session.server_ip, client_ip, listen_port, client_port,
-                                                  seq=session.server_seq, ack_seq=next_ack, ack=1)
+                                                  seq=session.server_seq, ack_seq=next_ack, ack=1,  window=_free_receive_window())
                     ip_header = build_ip_header(session.server_ip, client_ip, socket.IPPROTO_TCP, len(ack_packet))
                     s.sendto(ip_header + ack_packet, (client_ip, 0))
                     print(f"[Streap_raw] Sent ACK for data (Ack={next_ack})")
@@ -851,10 +855,11 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
         oldest_unacked = 0 #first unacked
         next_to_send = 0  #first never be sent
         packet_queue  = get_packet_queue(client_key)
-
+        rwnd = MESSAGE_SIZE
         #ADDED2: while lop forsend all the chopped
         while(oldest_unacked < len(segments)):
-            while next_to_send < len(segments) and next_to_send - oldest_unacked < SEND_WINDOW:
+            allowed_window = max(1, min(SEND_WINDOW, rwnd//MESSAGE_SIZE))
+            while next_to_send < len(segments) and next_to_send - oldest_unacked < allowed_window:
                 send_tcp_data_segment(
                 s, listen_ip, client_ip, listen_port, client_port,
                 seq=session.server_seq + next_to_send*MESSAGE_SIZE, ack_seq=session.client_seq, payload=segments[next_to_send]
@@ -892,7 +897,8 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                 return -1
             if not (flags &  0x10):  #ack
                 continue
-            
+            rwnd = tcph[6]
+            print(f"[FLOW_CONTROL] client window rwnd={rwnd}")
         # bytes_sent = send_tcp_data_segment(
         #     s, listen_ip, client_ip, listen_port, client_port,
         #     seq=session.server_seq, ack_seq=session.client_seq, payload=payload
