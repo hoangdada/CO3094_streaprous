@@ -73,8 +73,8 @@ DEFAULT_LISTEN_PORT = 22239
 DEFAULT_INTERFACE_NAME = "lo0"
 
 SELECTIVE_REPEAT_MSS = 1024
-SELECTIVE_REPEAT_WINDOW_SIZE = 4
-SELECTIVE_REPEAT_TIMEOUT = 0.5
+# SELECTIVE_REPEAT_WINDOW_SIZE = 4
+# SELECTIVE_REPEAT_TIMEOUT = 0.5
 SELECTIVE_REPEAT_MAX_RETRIES = 5
 # Receive window must match the window advertised in our TCP headers (5840),
 # otherwise a legitimate peer segment inside the advertised window is refused.
@@ -87,6 +87,34 @@ _SEQ_MOD = 1 << 32
 _out_of_order_segments: Dict[Tuple[str, int], Dict[int, bytes]] = {}
 _sack_enabled: Dict[Tuple[str, int], bool] = {}
 _out_of_order_segments_lock = threading.Lock()
+#CONGESTION CONTROL HELPER
+INITIAL_RTO = 1.0
+MIN_RTO = 0.2
+MAX_RTO = 60.0
+INITIAL_SSTHRESH = 64*1024
+DUP_ACK_THRESHOLD = 3
+class _SendState:
+    def __init__(self, peer_rwnd: int):
+        self.peer_rwnd = peer_rwnd
+        self.cwnd = SELECTIVE_REPEAT_MSS
+        self.ssthresh= INITIAL_SSTHRESH
+        self.srtt = None
+        self.rttvar = 0.0
+        self.rto = INITIAL_RTO
+        self.last_ack = 0
+        self.dup_acks = 0
+_send_state:Dict[Tuple[str,int], _SendState] = {}
+
+def _update_rto(send_state: _SendState, sample: float) -> None:
+    if send_state.srtt  is None:
+        send_state.srtt =sample
+        send_state.rttvar =  sample/2
+    else:
+        send_state.rttvar = 0.75*send_state.rttvar +0.25*abs(send_state.srtt - sample)
+        send_state.srtt = 0.875*send_state.srtt +0.125*sample
+    send_state.rto = min(max(send_state.srtt+4*send_state.rttvar,MIN_RTO),MAX_RTO)
+#END OF CONGESTION CONTROL HELPER
+
 
 
 def _seq_add(seq: int, n: int) -> int:
@@ -227,7 +255,7 @@ def build_tcp_packet(
         raise ValueError("TCP options cannot exceed 40 bytes")
     tcp_options += b"\x01" * (-len(tcp_options) % 4)
     offset_res = ((5 + len(tcp_options) // 4) << 4)
-    window = 5840
+    window = SELECTIVE_REPEAT_RECV_WINDOW 
     urg_ptr = 0
     draft_checksum = 0
 
@@ -355,7 +383,7 @@ def send_tcp_data_segment(s, src_ip, dest_ip, src_port, dst_port, seq, ack_seq, 
     #       need to modify in full schema
     flags = 0x18
     offset_res = (5 << 4) + 0
-    window = 5840
+    window = SELECTIVE_REPEAT_RECV_WINDOW 
     urg_ptr = 0
     draft_checksum = 0
     
@@ -578,6 +606,7 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
                 )
                 with _out_of_order_segments_lock:
                     _sack_enabled[client_key] = sack_permitted
+                    _send_state[client_key] = _SendState(peer_rwnd=tcph[6])
 
                 # Quick duplicate handshake check (fast, no heavy operations)
                 with handshake_lock:
@@ -921,6 +950,10 @@ def run_conn_recv(s: socket.socket, conn_info: conn_struct) -> bytes:
             # Handle pure ACK (no data)
             elif ack_flag and not syn_flag and not psh_flag and not has_data:
                 print(f"[Streap_raw] Received ACK from {client_ip}:{client_port} (Ack={pkt_ack})")
+                with _out_of_order_segments_lock:
+                    st = _send_state.get(client_key)
+                    if st is not None:
+                        st.peer_rwnd = tcph[6]
                 with connections_lock:
                     if client_key in connections:
                         current = connections[client_key]
@@ -977,6 +1010,10 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
     deferred_packets: List[Tuple[bytes, Tuple[str, int]]] = []
     next_segment = 0
     base_seq = session.server_seq
+    with _out_of_order_segments_lock:
+        st = _send_state.setdefault(client_key, _SendState(peer_rwnd=SELECTIVE_REPEAT_MSS))
+    st.last_ack = base_seq
+    st.dup_acks = 0
 
     def transmit(seq: int, segment: bytes, retries: int) -> None:
         sent = send_tcp_data_segment(
@@ -986,36 +1023,50 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
         if sent != len(segment):
             raise OSError(f"short send: expected {len(segment)} bytes, sent {sent}")
         outstanding[seq] = (segment, time.monotonic(), retries)
-
+    def bytes_in_flight() -> int:
+        return sum(len(state[0]) for state in outstanding.values())
     try:
         while next_segment < len(segments) or outstanding:
-            # Fill the send window.
-            while (
-                next_segment < len(segments)
-                and len(outstanding) < SELECTIVE_REPEAT_WINDOW_SIZE
-            ):
+            # Fill the send window: at most min(cwnd, peer_rwnd) un-ACKed bytes.
+            while next_segment < len(segments):
+                segment = segments[next_segment]
+                window = min(st.cwnd, st.peer_rwnd)
+                
+                if outstanding and bytes_in_flight() + len(segment) > window:
+                    break
                 seq = _seq_add(base_seq, next_segment * SELECTIVE_REPEAT_MSS)
-                transmit(seq, segments[next_segment], 0)
+                transmit(seq, segment, 0)
                 next_segment += 1
 
             # Selective repeat: retransmit only the segments whose own timer expired.
             now = time.monotonic()
-            for seq, state in list(outstanding.items()):
-                if now - state[1] < SELECTIVE_REPEAT_TIMEOUT:
-                    continue
-                if state[2] >= SELECTIVE_REPEAT_MAX_RETRIES:
-                    raise TimeoutError(f"segment at sequence {seq} was not acknowledged")
-                transmit(seq, state[0], state[2] + 1)
+            timed_out = [
+                seq for seq, state in outstanding.items()
+                if now - state[1] >= st.rto
+            ]
+            if timed_out:
+                # Congestion control on timeout: cut once per timeout event, not
+                st.ssthresh = max(bytes_in_flight() // 2, 2 * SELECTIVE_REPEAT_MSS)
+                st.cwnd = SELECTIVE_REPEAT_MSS
+                st.rto = min(st.rto * 2, MAX_RTO)   # exponential backoff
+                st.dup_acks = 0
+                for seq in timed_out:
+                    state = outstanding[seq]
+                    # A zero window is the client pausing, not loss: don't give up.
+                    if state[2] >= SELECTIVE_REPEAT_MAX_RETRIES and st.peer_rwnd > 0:
+                        raise TimeoutError(f"segment at sequence {seq} was not acknowledged")
+                    transmit(seq, state[0], state[2] + 1)
 
             # Sleep only until the earliest timer expires.
             now = time.monotonic()
             wait_timeout = max(
                 0.001,
                 min(
-                    SELECTIVE_REPEAT_TIMEOUT - (now - state[1])
+                    st.rto - (now - state[1])
                     for state in outstanding.values()
                 ),
             )
+
             try:
                 packet, addr = packet_queue.get(timeout=wait_timeout)
             except queue.Empty:
@@ -1027,16 +1078,14 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                 continue
             tcp_packet = packet[ihl:]
 
-            src_port, dest_port, _, pkt_ack, _, flags, _, _, _ = struct.unpack(
+            src_port, dest_port, _, pkt_ack, _, flags, peer_window, _, _ = struct.unpack(
                 "!HHLLBBHHH", tcp_packet[:20]
             )
             if src_port != client_port or dest_port != listen_port:
                 deferred_packets.append((packet, addr))
                 continue
 
-            # A reset aborts the transfer; hand the RST back to run_conn_recv so
-            # it can clean the connection up.
-            if flags & 0x04:
+            if flags & 0x04: #RST
                 deferred_packets.append((packet, addr))
                 raise ConnectionResetError("connection reset by peer during send")
 
@@ -1056,8 +1105,40 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                         for sack_start, sack_end in sack_blocks
                     ):
                         acknowledged_sequences.append(seq)
+
+            # RTT sample. Karn's rule: only from segments never retransmitted.
+            for seq in acknowledged_sequences:
+                if outstanding[seq][2] == 0:
+                    _update_rto(st, time.monotonic() - outstanding[seq][1])
+                    break
             for seq in acknowledged_sequences:
                 del outstanding[seq]
+
+            if flags & 0x10 and not flags & 0x02:
+                # Flow control: remember the client's latest advertised window.
+                st.peer_rwnd = peer_window
+
+                if _seq_lt(st.last_ack, pkt_ack):
+                    acked = _seq_diff(pkt_ack, st.last_ack)
+                    st.last_ack = pkt_ack
+                    st.dup_acks = 0
+                    if st.cwnd < st.ssthresh:
+                        # Slow start: +1 MSS per ACK (doubles every RTT).
+                        st.cwnd += min(acked, SELECTIVE_REPEAT_MSS)
+                    else:
+                        # Congestion avoidance: about +1 MSS per RTT.
+                        st.cwnd += max(1, SELECTIVE_REPEAT_MSS * SELECTIVE_REPEAT_MSS // st.cwnd)
+                elif is_pure_ack and pkt_ack == st.last_ack and outstanding:
+                    st.dup_acks += 1
+                    if st.dup_acks == DUP_ACK_THRESHOLD:
+                        # Fast retransmit + fast recovery.
+                        st.ssthresh = max(bytes_in_flight() // 2, 2 * SELECTIVE_REPEAT_MSS)
+                        st.cwnd = st.ssthresh
+                        if pkt_ack in outstanding:
+                            state = outstanding[pkt_ack]
+                            transmit(pkt_ack, state[0], state[2] + 1)
+
+
             if acknowledged_sequences:
                 with connections_lock:
                     if client_key in connections:
@@ -1066,8 +1147,6 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                             last_activity=time.time()
                         )
 
-            # Pure ACKs are fully consumed here; anything else (request data, FIN,
-            # ...) belongs to run_conn_recv.
             if not is_pure_ack:
                 deferred_packets.append((packet, addr))
 
@@ -1093,7 +1172,7 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
             except queue.Full:
                 print(f"[Streap_raw] run_conn_send could not restore a deferred packet")
 
-
+   
 def close_connection(s: socket.socket, conn_info: conn_struct):
     """Close a specific connection by sending FIN and removing from connection table."""
     client_ip = conn_info.client_ip
@@ -1118,6 +1197,7 @@ def close_connection(s: socket.socket, conn_info: conn_struct):
     with _out_of_order_segments_lock:
         _out_of_order_segments.pop(client_key, None)
         _sack_enabled.pop(client_key, None)
+        _send_state.pop(client_key, None)
 
 
 def close_all_connections():
@@ -1127,3 +1207,4 @@ def close_all_connections():
     with _out_of_order_segments_lock:
         _out_of_order_segments.clear()
         _sack_enabled.clear()
+        _send_state.clear()
