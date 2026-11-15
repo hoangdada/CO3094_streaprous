@@ -1055,7 +1055,11 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                     # A zero window is the client pausing, not loss: don't give up.
                     if state[2] >= SELECTIVE_REPEAT_MAX_RETRIES and st.peer_rwnd > 0:
                         raise TimeoutError(f"segment at sequence {seq} was not acknowledged")
-                    transmit(seq, state[0], state[2] + 1)
+                    if st.peer_rwnd == 0:
+                        retries = max(state[2], 1)
+                    else:
+                        retries = state[2] + 1
+                    transmit(seq, state[0], retries)
 
             # Sleep only until the earliest timer expires.
             now = time.monotonic()
