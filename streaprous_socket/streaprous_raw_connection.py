@@ -248,9 +248,11 @@ def send_tcp_data_segment(s, src_ip, dest_ip, src_port, dst_port, seq, ack_seq, 
     #       need to modify in full schema
     flags = 0x18
     offset_res = (5 << 4) + 0
-    window = 5840
+    # window = 5840
     urg_ptr = 0
     draft_checksum = 0
+    client_key = (dest_ip, dst_port)
+    window = _free_receive_window(client_key)
     
     # Build draft header with no checksum
     tcp_header_temp = struct.pack('!HHLLBBHHH',
@@ -301,6 +303,9 @@ def clean_expired_connections(timeout=60):
             for k in expired:
                 print(f"[Streap_raw] clean_expired_connections: Session [{k[0]}:{k[1]}] Connection timed out ({timeout}s inactivity). Remove connection.")
                 del connections[k]
+                _early_segments.pop(k, None)
+        for k in expired: 
+            remove_packet_queue(k)
 
 
 def create_raw_socket() -> socket.socket:
@@ -622,26 +627,30 @@ MESSAGE_SIZE = 1000
 SEND_WINDOW = 4 
 RETRANSMISSION_TIMEOUT = 2.0
 MAX_RETRIES = 5
+#selective_recv
+_early_segments = {}
+_congestion_windows = {}
 def _load_connection_record(connection_key):
     with connections_lock: return connections.get(connection_key)
 
 def _forget_connection(connection_key):
-    with connections_lock: connections.pop(connection_key, None)
-    _early_segments.clear()
+    with connections_lock: 
+        connections.pop(connection_key, None)
+        _early_segments.pop(connection_key,None)
     remove_packet_queue(connection_key)
 
 def _send_pure_ack(raw_socket, connection_record, ack_number):
-    window = _free_receive_window()
+    client_key = (connection_record.client_ip, connection_record.client_port)
+    window = _free_receive_window(client_key)
     tcp_header = build_tcp_packet(connection_record.server_ip, connection_record.client_ip, connection_record.server_port, connection_record.client_port, 
                                   connection_record.server_seq,  ack_seq=ack_number, ack = 1, window=window)
     ip_header = build_ip_header(connection_record.server_ip, connection_record.client_ip, socket.IPPROTO_TCP, len(tcp_header))
     raw_socket.sendto(ip_header + tcp_header, (connection_record.client_ip, 0))
 
-#selective_recv
-_early_segments = {}
-def _free_receive_window():
-    buffered = sum(len(p)   for p in _early_segments.values())
+def _free_receive_window(connection_key):
+    buffered = len(_early_segments.get(connection_key,{}))
     return  max(0,RECEIVE_CAP-buffered)
+
 def run_conn_recv(s: socket.socket, conn_info: conn_struct) -> bytes:
     """
     Receive data on an established connection using raw sockets.
@@ -661,7 +670,7 @@ def run_conn_recv(s: socket.socket, conn_info: conn_struct) -> bytes:
     listen_ip = conn_info.server_ip
     listen_port = conn_info.server_port
     
-    if _load_connection_record(connection_key=client_key) is None: return None
+    if _load_connection_record(connection_key=client_key) is None: return b""
     
     # Get the packet queue for this connection from the dispatcher
     packet_queue = get_packet_queue(client_key)
@@ -678,7 +687,7 @@ def run_conn_recv(s: socket.socket, conn_info: conn_struct) -> bytes:
                 if time.time() >  idle_deadline:
                     print("idle time out")
                     _forget_connection(client_key)
-                    return None
+                    return b""
                 continue
 
             # Extract IP Header Length
@@ -735,7 +744,7 @@ def run_conn_recv(s: socket.socket, conn_info: conn_struct) -> bytes:
                     if client_key in connections:
                         del connections[client_key]
                 # Clean up packet queue
-                _early_segments.clear()
+                _early_segments.pop(client_key,None)
                 remove_packet_queue(client_key)
                 return b""
 
@@ -746,7 +755,7 @@ def run_conn_recv(s: socket.socket, conn_info: conn_struct) -> bytes:
                     if client_key in connections:
                         del connections[client_key]
                 # Clean up packet queue
-                _early_segments.clear()
+                _early_segments.pop(client_key,None)
                 remove_packet_queue(client_key)
                 return b""
 
@@ -768,27 +777,55 @@ def run_conn_recv(s: socket.socket, conn_info: conn_struct) -> bytes:
                     print(f"[Streap_raw] Received {len(app_payload)} bytes of data from {client_ip}:{client_port}")
                     print(f"[Streap_raw] Received payload: {app_payload[:100]}...")
 
-                    #ADDED 1: if the segment is not what expected still store 
+                    #ADDED 1: if the segment is not what expected still store ( with the seq number check)
                     expected_seq = session.client_seq
-                    bytes_ahead = (pkt_seq - expected_seq) 
-                    if bytes_ahead != 0:
-                        if 0 < bytes_ahead < RECEIVE_CAP - len(app_payload):
-                            _early_segments[pkt_seq] = app_payload
-                        _send_pure_ack(s, session, expected_seq)
+                    
+                    # Adding the buffered segments for early arrived packets for each client_key
+                    if client_key not in _early_segments:
+                        _early_segments[client_key] = {}
+                        
+                    buffered = _early_segments[client_key]
+                    last_seq = expected_seq + RECEIVE_CAP
+                    
+                    seq = pkt_seq
+                    for byte in app_payload:
+                        if expected_seq <= seq < last_seq and seq not in buffered:
+                            buffered[seq] = byte
+                        seq += 1
+                    next_ack = expected_seq 
+                    ready_to_ack = []
+                    
+                    while next_ack in buffered:
+                        ready_to_ack.append(buffered[next_ack])
+                        del buffered[next_ack]
+                        next_ack += 1
+                    
+                    if not ready_to_ack :
+                        _send_pure_ack(s,session,expected_seq)
                         idle_deadline = time.time() + RECEIVER_IDLE_TIMEOUT
                         continue
+                    app_payload = bytes(ready_to_ack)
+                    
+                    
+                    # bytes_ahead = (pkt_seq - expected_seq) 
+                    # if bytes_ahead != 0:
+                    #     if 0 < bytes_ahead < RECEIVE_CAP - len(app_payload):
+                    #         _early_segments[pkt_seq] = app_payload
+                    #     _send_pure_ack(s, session, expected_seq)
+                    #     idle_deadline = time.time() + RECEIVER_IDLE_TIMEOUT
+                    #     continue
 
                     # Send ACK for received data IMMEDIATELY (fast path)
-                    next_ack = pkt_seq + len(app_payload)
+                    # next_ack = pkt_seq + len(app_payload)
 
-                    #ADDED 2: in the buffer now  just  pop it
-                    while next_ack  in _early_segments:
-                        buffered_payload = _early_segments.pop(next_ack)
-                        app_payload += buffered_payload
-                        next_ack  += len(buffered_payload)
+                    # #ADDED 2: in the buffer now  just  pop it
+                    # while next_ack  in _early_segments:
+                    #     buffered_payload = _early_segments.pop(next_ack)
+                    #     app_payload += buffered_payload
+                    #     next_ack  += len(buffered_payload)
 
                     ack_packet = build_tcp_packet(session.server_ip, client_ip, listen_port, client_port,
-                                                  seq=session.server_seq, ack_seq=next_ack, ack=1,  window=_free_receive_window())
+                                                  seq=session.server_seq, ack_seq=next_ack, ack=1,  window=_free_receive_window(client_key))
                     ip_header = build_ip_header(session.server_ip, client_ip, socket.IPPROTO_TCP, len(ack_packet))
                     s.sendto(ip_header + ack_packet, (client_ip, 0))
                     print(f"[Streap_raw] Sent ACK for data (Ack={next_ack})")
@@ -841,6 +878,9 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
     listen_ip = conn_info.server_ip
     listen_port = conn_info.server_port
     
+    
+    
+    
     with connections_lock:
         if client_key not in connections:
             print(f"[Streap_raw] run_conn_send Connection not found for {client_ip}:{client_port}")
@@ -854,31 +894,62 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
         retries  =  [0 for _ in range(0, len(segments))]
         oldest_unacked = 0 #first unacked
         next_to_send = 0  #first never be sent
+        highest_ack = session.server_seq # initialize the highest ack to send
+        
+        # Congestion Window 
+        "Adding state for the congestion window"
+        last_ack = session.server_seq
+        cwnd = 1.0
+        ssthresh = (64*1024)/MESSAGE_SIZE
+        duplicate_acks = 0
+        in_fast_recovery = False
+        
+        
         packet_queue  = get_packet_queue(client_key)
         rwnd = MESSAGE_SIZE
         #ADDED2: while lop forsend all the chopped
         while(oldest_unacked < len(segments)):
-            allowed_window = max(1, min(SEND_WINDOW, rwnd//MESSAGE_SIZE))
-            while next_to_send < len(segments) and next_to_send - oldest_unacked < allowed_window:
+            # allowed_window = max(1, min(SEND_WINDOW, rwnd//MESSAGE_SIZE))
+            send_limit = min(int(cwnd * MESSAGE_SIZE),rwnd)
+            while next_to_send < len(segments):
+                # in-flight segments too much
+                if next_to_send - oldest_unacked >= SEND_WINDOW:
+                    break
+                
+                segment = segments[next_to_send]
+                bytes_in_flight = highest_ack - last_ack
+                
+                if bytes_in_flight + len(segment) > send_limit:
+                    break
+                
                 send_tcp_data_segment(
                 s, listen_ip, client_ip, listen_port, client_port,
                 seq=session.server_seq + next_to_send*MESSAGE_SIZE, ack_seq=session.client_seq, payload=segments[next_to_send]
             )
+                #update the highest ack after segment sending 
+                highest_ack += len(segments[next_to_send])
                 sent_at[next_to_send] = time.time()
                 next_to_send += 1
 
             #timer 
-            for i in range(oldest_unacked, next_to_send):
-                if time.time() - sent_at[i] > RETRANSMISSION_TIMEOUT:
+            #modify: reduce congestion window while being timed out
+            i = oldest_unacked
+            if i < next_to_send:
+                waiting_time = time.time() - sent_at[i]
+                if waiting_time > RETRANSMISSION_TIMEOUT:
+                    if retries[i] >= MAX_RETRIES:
+                        print(f"[Streap_raw] run_conn_send Segment {i} gave up  to {client_ip}:{client_port}")
+                        return -1
+                    ssthresh = max(2.0, cwnd/2)
+                    cwnd = 1.0
+                    duplicate_acks = 0
+                    in_fast_recovery = False
                     send_tcp_data_segment(
                         s, listen_ip, client_ip, listen_port, client_port,
                         seq=session.server_seq + i*MESSAGE_SIZE, ack_seq=session.client_seq, payload=segments[i]
                     )
                     sent_at[i] = time.time()
                     retries[i]  += 1
-                    if retries[i] >= MAX_RETRIES:
-                        print(f"[Streap_raw] run_conn_send Segment {i} gave up  to {client_ip}:{client_port}")
-                        return -1
 
             #wait ack 
             try:
@@ -887,6 +958,7 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                 continue
             ihl = (packet[0] & 0x0F) * 4
             tcp_packet = packet[ihl:]
+            tcp_header_len = (tcp_packet[12] >> 4) * 4
             if len(tcp_packet) < 20:
                 continue
             tcph = struct.unpack('!HHLLBBHHH', tcp_packet[:20])
@@ -897,15 +969,57 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
                 return -1
             if not (flags &  0x10):  #ack
                 continue
+            #cap the highest_ack 
+            if pkt_ack < last_ack or pkt_ack > highest_ack:
+                continue
+            
             rwnd = tcph[6]
+            if pkt_ack == last_ack:
+                has_payload = len(tcp_packet) > tcp_header_len
+                if oldest_unacked == next_to_send or has_payload:
+                    continue
+                duplicate_acks += 1
+                if in_fast_recovery:
+                    cwnd +=1
+                elif duplicate_acks == 3:
+                    ssthresh = max(2.0, cwnd/2)
+                    cwnd = ssthresh + 3.0
+                    in_fast_recovery = True
+                    
+                    i = oldest_unacked
+                    send_tcp_data_segment(s, listen_ip, client_ip, listen_port, client_port,
+                                          seq=session.server_seq+i*MESSAGE_SIZE,
+                                          ack_seq=session.client_seq,
+                                          payload=segments[i]
+                                          )
+                    sent_at[i] = time.time()
+                continue
+            last_ack = pkt_ack
+            duplicate_acks = 0
+            if in_fast_recovery:
+                cwnd = ssthresh 
+                in_fast_recovery = False
+            elif cwnd < ssthresh:
+                cwnd+=1.0
+            else:
+                cwnd +=1/cwnd
+            
+            while oldest_unacked < next_to_send:
+                segment_start = session.server_seq +oldest_unacked * MESSAGE_SIZE
+                segment_end = segment_start + len(segments[oldest_unacked])
+                if pkt_ack <segment_end:
+                    break
+                oldest_unacked +=1
+            if oldest_unacked < next_to_send:
+                sent_at[oldest_unacked] = time.time()
             print(f"[FLOW_CONTROL] client window rwnd={rwnd}")
-        # bytes_sent = send_tcp_data_segment(
+        #  bytes_sent = send_tcp_data_segment(
         #     s, listen_ip, client_ip, listen_port, client_port,
         #     seq=session.server_seq, ack_seq=session.client_seq, payload=payload
-        # )
-            bytes_acked = pkt_ack - session.server_seq
-            while oldest_unacked <len(segments) and oldest_unacked*MESSAGE_SIZE + len(segments[oldest_unacked]) <= bytes_acked:
-                oldest_unacked += 1
+        #  )
+        #     bytes_acked = pkt_ack - session.server_seq
+        #     while oldest_unacked <len(segments) and oldest_unacked*MESSAGE_SIZE + len(segments[oldest_unacked]) <= bytes_acked:
+        #         oldest_unacked += 1
 
         bytes_sent = len(payload)
         print(f"[Streap_raw] run_conn_send Sent {bytes_sent} bytes to {client_ip}:{client_port}")
@@ -937,6 +1051,8 @@ def close_connection(s: socket.socket, conn_info: conn_struct):
     with connections_lock:
         if client_key in connections:
             session = connections[client_key]
+            cwnd, ssthresh = _congestion_windows.get(client_key, (1.0, (64 * 1024) / MESSAGE_SIZE)
+)
             # Send FIN packet
             fin_packet = build_tcp_packet(listen_ip, client_ip, listen_port, client_port,
                                           seq=session.server_seq, ack_seq=session.client_seq, ack=1, fin=1)
@@ -972,7 +1088,7 @@ def close_connection(s: socket.socket, conn_info: conn_struct):
         if not fin_acked:
             print(f"[Streap_raw] run_conn_send: FIN not acked by {client_ip}:{client_port}")
     # Clean up packet queue
-    _early_segments.clear()
+    _early_segments.pop(client_key,None)
     remove_packet_queue(client_key)
 
 
@@ -980,3 +1096,4 @@ def close_all_connections():
     """Close all connections and clean up."""
     with connections_lock:
         connections.clear()
+        _early_segments.clear()
