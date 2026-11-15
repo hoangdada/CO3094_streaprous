@@ -213,11 +213,12 @@ class HttpAdapter:
         print(f"[HttpAdapter] HTTP Response ({len(response)} bytes): {response[:200]}")
 
         try:
-            run_conn_send(raw_socket, conn_info, response)
-        
-            # Wait longer to ensure response is transmitted, client processes it, and sends ACK
-            import time
-            time.sleep(2.0)
+            bytes_sent = run_conn_send(raw_socket, conn_info, response)
+            if bytes_sent != len(response):
+                print(
+                    f"[HttpAdapter] Failed to send complete response "
+                    f"({bytes_sent}/{len(response)} bytes)"
+                )
         finally:
             close_connection(raw_socket, conn_info)
 
