@@ -1,12 +1,18 @@
 import json
 
 from daemon import StreapRous
-from app import peer, tracker_client, p2p_client
+from app import peer, connection, tracker_client, p2p_client
 
+TRACKER_IP = "127.0.0.1"
+TRACKER_PORT = 8000
 
 app = StreapRous()
 current_user = None
 
+def set_tracker(ip, port):
+    global TRACKER_IP, TRACKER_PORT
+    TRACKER_IP = ip
+    TRACKER_PORT = int(port)
 
 def read_body(body):
     if isinstance(body, bytes):
@@ -19,12 +25,6 @@ def read_body(body):
 
     return data
 
-def get_cookie(headers):
-    for key, value in (headers or {}).items():
-        if key.lower() == "cookie":
-            return value
-    return None
-
 def json_response(data, status_code=200, headers=None):
     content = json.dumps(data).encode("utf-8")
     return headers or {}, status_code, content
@@ -34,17 +34,6 @@ def error(message, status=400):
         {"message": message},
         status_code=status,
         headers={}
-    )
-
-def tracker_result(result):
-    headers = {}
-    if result.get("set_cookie"):
-        headers["Set-Cookie"] = result["set_cookie"]
-
-    return json_response(
-        result.get("data", {}),
-        status_code=result["status_code"],
-        headers=headers
     )
 
 def valid_port(port):
@@ -61,48 +50,75 @@ def login(headers, body, client_ip=None):
     global current_user
 
     try:
-        data = read_body(body)
-        username = data["username"]
-        password = data["password"]
-    except ValueError, KeyError:
-        return error("Invalid username or password payload", 400)
+        resp_headers, status_code, content = connection.send_request(
+            method='POST',
+            path='/login',
+            headers=headers,
+            body=body,
+            ip=TRACKER_IP,
+            port=TRACKER_PORT
+        )
+    except Exception as e:
+        return error(f"Cannot communicate with Tracker: {e}", 502)
 
-    result = tracker_client.login(username, password)
+    if status_code == 200:
+        resp_data = json.loads(content.decode("utf-8"))
+        current_user = resp_data.get("username")
 
-    if result["status_code"] == 200:
-        current_user = username
-
-    return tracker_result(result)
+    return resp_headers, status_code, content
 
 @app.route('/submit-info', methods=['POST'])
 def submit_info(headers, body, client_ip=None):
     try:
-        data = read_body(body)
-        port = valid_port(data["port"])
-    except ValueError, KeyError:
-        return error("Invalid port", 400)
-
-    result = tracker_client.submit_info(port, get_cookie(headers))
-    return tracker_result(result)
+        return connection.send_request(
+            method='POST',
+            path='/submit-info',
+            headers=headers,
+            body=body,
+            ip=TRACKER_IP,
+            port=TRACKER_PORT
+        )
+    except Exception as e:
+        return error(f"Cannot communicate with Tracker: {e}", 502)
 
 @app.route('/logout', methods=['POST'])
 def logout(headers, body, client_ip=None):
     global current_user
 
-    result = tracker_client.logout(get_cookie(headers))
-    if result["status_code"] == 200:
+    try:
+        resp_headers, status_code, content = connection.send_request(
+            method='POST',
+            path='/logout',
+            headers=headers,
+            body=body,
+            ip=TRACKER_IP,
+            port=TRACKER_PORT
+        )
+    except Exception as e:
+        return error(f"Cannot communicate with Tracker: {e}", 502)
+
+    if status_code == 200:
         current_user = None
 
-    return tracker_result(result)
+    return resp_headers, status_code, content
 
 @app.route('/get-list', methods=['GET'])
 def get_list(headers, body, client_ip=None):
-    result = tracker_client.get_list(get_cookie(headers))
+    try:
+        resp_headers, status_code, content = connection.send_request(
+            method='GET',
+            path='/peer-list',
+            headers=headers,
+            ip=TRACKER_IP,
+            port=TRACKER_PORT
+        )
+    except Exception as e:
+        return error(f"Cannot communicate with Tracker: {e}", 502)
 
-    if result["status_code"] != 200:
-        return tracker_result(result)
+    if status_code != 200:
+        return resp_headers, status_code, content
 
-    directory = result.get("data", {})
+    directory = json.loads(content.decode("utf-8"))
     raw_peers = directory.get("peers", {}) if isinstance(directory, dict) else directory
 
     if isinstance(raw_peers, dict):

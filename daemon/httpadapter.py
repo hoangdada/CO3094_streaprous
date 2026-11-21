@@ -219,6 +219,9 @@ class HttpAdapter:
                     f"[HttpAdapter] Failed to send complete response "
                     f"({bytes_sent}/{len(response)} bytes)"
                 )
+
+            import time
+            time.sleep(3.0)
         finally:
             close_connection(raw_socket, conn_info)
 

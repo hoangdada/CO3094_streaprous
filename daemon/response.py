@@ -273,7 +273,7 @@ class Response():
             ).encode('utf-8')
 
 
-    def build_response(self, request, content=None):
+    def build_response(self, request, headers={}, status_code=200, content=None):
         """
         Builds a full HTTP response including headers and content based on the request.
 
@@ -286,9 +286,9 @@ class Response():
         path = request.path
 
         # Initialize response state
-        self.status_code = 200
+        self.status_code = status_code
         self.reason = None
-        self.headers = {}
+        self.headers = headers
 
         # Path A: Dynamic application response
         if content is not None:
