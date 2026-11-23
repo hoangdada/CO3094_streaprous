@@ -1,14 +1,29 @@
 "use strict";
 
 const currentUserEl = document.getElementById("current-user");
+const myPeerInfoEl = document.getElementById("my-peer-info");
+const readyBtn = document.getElementById("ready-btn");
+const refreshBtn = document.getElementById("refresh-btn");
+const logoutBtn = document.getElementById("logout-btn");
 const messageEl = document.getElementById("app-message");
 const peerListEl = document.getElementById("peer-list");
 
 /**
- * Clear session and redirect to login.
+ * Display a status or error message.
+ * @param {string} text
+ * @param {boolean} [isError=false]
+ */
+function setMessage(text, isError = false) {
+  messageEl.className = isError ? "error" : "";
+  messageEl.textContent = text;
+}
+
+/**
+ * Clear session state and redirect to login.
  */
 function redirectToLogin() {
   sessionStorage.removeItem("username");
+  sessionStorage.removeItem("myPeer");
   window.location.replace("/login.html");
 }
 
@@ -34,12 +49,11 @@ function renderPeers(peersMap) {
 }
 
 /**
- * Verify session and load dashboard.
+ * Verify session and load dashboard state.
  * @returns {Promise<void>}
  */
 async function bootApp() {
-  messageEl.textContent = "";
-  messageEl.className = "";
+  setMessage("");
 
   const res = await apiGetPeerList();
   if (res.status === 401) {
@@ -47,14 +61,94 @@ async function bootApp() {
     return;
   }
   if (!res.ok) {
-    messageEl.className = "error";
-    messageEl.textContent = res.message;
+    setMessage(res.message, true);
     return;
   }
 
   currentUserEl.textContent =
     sessionStorage.getItem("username") || "Authenticated user";
+  const myPeer = sessionStorage.getItem("myPeer");
+  if (myPeer) {
+    myPeerInfoEl.textContent = myPeer;
+  }
   renderPeers(res.data && res.data.peers);
 }
 
+/**
+ * Register the current client peer info.
+ * @returns {Promise<void>}
+ */
+async function handleReadyClick() {
+  readyBtn.disabled = true;
+  setMessage("");
+
+  const port = Number(window.location.port || 80);
+  const res = await apiSubmitInfo(port);
+  readyBtn.disabled = false;
+
+  if (res.status === 401) {
+    redirectToLogin();
+    return;
+  }
+  if (!res.ok) {
+    setMessage(res.message, true);
+    return;
+  }
+
+  if (res.data && res.data.username) {
+    currentUserEl.textContent = res.data.username;
+    sessionStorage.setItem("username", res.data.username);
+  }
+  if (res.data) {
+    const peerText = `${res.data.ip}:${res.data.port}`;
+    sessionStorage.setItem("myPeer", peerText);
+    myPeerInfoEl.textContent = peerText;
+  }
+  setMessage(res.message);
+}
+
+/**
+ * Refresh the list of active peers.
+ * @returns {Promise<void>}
+ */
+async function handleRefreshClick() {
+  refreshBtn.disabled = true;
+  setMessage("");
+
+  const res = await apiGetPeerList();
+  refreshBtn.disabled = false;
+
+  if (res.status === 401) {
+    redirectToLogin();
+    return;
+  }
+  if (!res.ok) {
+    setMessage(res.message, true);
+    return;
+  }
+
+  renderPeers(res.data && res.data.peers);
+}
+
+/**
+ * Log out the current user session.
+ * @returns {Promise<void>}
+ */
+async function handleLogoutClick() {
+  logoutBtn.disabled = true;
+  setMessage("");
+
+  const res = await apiLogout();
+  if (res.ok || res.status === 401) {
+    redirectToLogin();
+    return;
+  }
+
+  logoutBtn.disabled = false;
+  setMessage(res.message, true);
+}
+
+readyBtn.addEventListener("click", handleReadyClick);
+refreshBtn.addEventListener("click", handleRefreshClick);
+logoutBtn.addEventListener("click", handleLogoutClick);
 bootApp();
