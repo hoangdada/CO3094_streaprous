@@ -28,7 +28,9 @@ import json
 import socket
 import argparse
 
-from app import create_trackerapp
+from app.trackerapp import app as tracker_app, create_trackerapp
+from daemon.backend import create_backend
+from start_backend import setup_rst_block
 
 PORT = 2026  # Default port
 
@@ -37,10 +39,19 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(prog='Backend', description='', epilog='Beckend daemon')
     parser.add_argument('--server-ip', default='0.0.0.0')
     parser.add_argument('--server-port', type=int, default=PORT)
- 
+    parser.add_argument('--interface', default=None)
+
     args = parser.parse_args()
     ip = args.server_ip
     port = args.server_port
 
-    # Prepare and launch the RESTful application
-    create_trackerapp(ip, port)
+    is_localhost = (
+        ip in ('127.0.0.1', '::1', 'localhost') or ip.startswith('127.')
+    )
+    if not is_localhost:
+        setup_rst_block(ip, port)
+
+    if args.interface:
+        create_backend(ip, port, tracker_app.routes, args.interface)
+    else:
+        create_trackerapp(ip, port)
