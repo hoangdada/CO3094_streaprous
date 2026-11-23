@@ -11,3 +11,4 @@
 #
 
 from .sampleapp import create_sampleapp
+from .trackerapp import create_trackerapp
