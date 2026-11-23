@@ -164,13 +164,13 @@ class Response():
             base_dir = BASE_DIR + "www/"
 
         elif mime_type == 'text/css':
-            base_dir = BASE_DIR + "static/css/"
+            base_dir = BASE_DIR + "static/"
 
         elif mime_type in ('text/javascript', 'application/javascript'):
-            base_dir = BASE_DIR + "static/js/"
+            base_dir = BASE_DIR + "static/"
 
         elif main_type == 'image':
-            base_dir = BASE_DIR + "static/images/"
+            base_dir = BASE_DIR + "static/"
 
         elif main_type == 'text' and sub_type == 'plain':
             base_dir = BASE_DIR + "static/"
@@ -273,7 +273,7 @@ class Response():
             ).encode('utf-8')
 
 
-    def build_response(self, request, headers={}, status_code=200, content=None):
+    def build_response(self, request, headers=None, status_code=200, content=None):
         """
         Builds a full HTTP response including headers and content based on the request.
 
@@ -288,7 +288,7 @@ class Response():
         # Initialize response state
         self.status_code = status_code
         self.reason = None
-        self.headers = headers
+        self.headers = dict(headers) if headers else {}
 
         # Path A: Dynamic application response
         if content is not None:

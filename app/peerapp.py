@@ -102,7 +102,7 @@ def logout(headers, body, client_ip=None):
 
     return resp_headers, status_code, content
 
-@app.route('/get-list', methods=['GET'])
+@app.route('/peer-list', methods=['GET'])
 def get_list(headers, body, client_ip=None):
     try:
         resp_headers, status_code, content = connection.send_request(

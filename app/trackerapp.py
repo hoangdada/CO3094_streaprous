@@ -102,10 +102,15 @@ def login(headers="guest", body="anonymous",  client_ip=None):
         username = data.get("username")
         password = data.get("password")
 
-    except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
+    except (AttributeError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return json_response({"message": "Invalid request body"}, 400)
 
-    if not isinstance(username, str) or not isinstance(password, str):
+    if (
+        not isinstance(username, str)
+        or not isinstance(password, str)
+        or not username.strip()
+        or not password
+    ):
         return json_response({"message": "Username and password are required"}, 400)
 
     if credentials.get(username) != password:
@@ -133,7 +138,7 @@ def submit_info(headers=None, body=None, username=None, client_ip=None):
         data = parse_json_body(body)
         port = data.get("port")
 
-    except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
+    except (AttributeError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return json_response({"message": "Invalid request body"}, 400)
 
     # Validate port
