@@ -107,3 +107,43 @@ function apiGetPeerList() {
 function apiLogout() {
   return requestJson("/logout", { method: "POST" });
 }
+
+/**
+ * Fetch message history for the current peer session.
+ * @returns {Promise<ApiResult>}
+ */
+function apiGetMessages() {
+  return requestJson("/messages");
+}
+
+/**
+ * Send a direct P2P message to a target peer.
+ * @param {string} targetIp
+ * @param {number} targetPort
+ * @param {string} targetUsername
+ * @param {string} message
+ * @returns {Promise<ApiResult>}
+ */
+function apiSendPeer(targetIp, targetPort, targetUsername, message) {
+  return requestJson("/send-peer", {
+    method: "POST",
+    body: {
+      target_ip: targetIp,
+      target_port: targetPort,
+      target_username: targetUsername,
+      message: message,
+    },
+  });
+}
+
+/**
+ * Broadcast a message to all active peers.
+ * @param {string} message
+ * @returns {Promise<ApiResult>}
+ */
+function apiBroadcastPeer(message) {
+  return requestJson("/broadcast-peer", {
+    method: "POST",
+    body: { message },
+  });
+}

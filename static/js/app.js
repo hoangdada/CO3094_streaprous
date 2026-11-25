@@ -34,6 +34,9 @@ function redirectToLogin() {
 function renderPeers(peersMap) {
   peerListEl.textContent = "";
   const peers = Object.values(peersMap || {});
+  if (typeof renderPeerOptions === "function") {
+    renderPeerOptions(peers);
+  }
   if (peers.length === 0) {
     const item = document.createElement("li");
     item.textContent = "No active peers online";
@@ -72,6 +75,9 @@ async function bootApp() {
     myPeerInfoEl.textContent = myPeer;
   }
   renderPeers(res.data && res.data.peers);
+  if (typeof loadMessages === "function") {
+    await loadMessages();
+  }
 }
 
 /**
