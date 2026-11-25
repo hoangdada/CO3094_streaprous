@@ -85,11 +85,12 @@ function apiLogin(username, password) {
 
 /**
  * Submit the client listening port to register peer info.
+ * @param {string} ip
  * @param {number} port
  * @returns {Promise<ApiResult>}
  */
-function apiSubmitInfo(port) {
-  return requestJson("/submit-info", { method: "POST", body: { port } });
+function apiSubmitInfo(ip, port) {
+  return requestJson("/submit-info", { method: "POST", body: { ip, port } });
 }
 
 /**
