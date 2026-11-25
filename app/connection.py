@@ -1,16 +1,19 @@
 import json
+import platform
 import queue
 import random
 import socket
 import struct
+import subprocess
 import threading
 import time
 
 _outbound_lock = threading.Lock()
+_outbound_call_lock = threading.Lock()
 _outbound_raw_socket = None
-_outbound_guard_socket = None
-_outbound_local_port = None
 _outbound_dispatcher_thread = None
+_active_local_port = None
+_local_ip = None
 
 from streaprous_socket.streaprous_packet_dispatcher import (
     _packet_dispatcher_lock,
@@ -80,7 +83,6 @@ def build_request(method, path, headers=None, body=b"", host_ip=None, host_port=
     else:
         body_bytes = json.dumps(body).encode("utf-8")
 
-    # Start with request line and updated Host header
     lines = [
         f"{method} {path} HTTP/1.1",
         f"Host: {target_ip}:{target_port}",
@@ -92,7 +94,6 @@ def build_request(method, path, headers=None, body=b"", host_ip=None, host_port=
     elif method in ("POST", "PUT"):
         lines.append("Content-Length: 0")
 
-    # Check for cookie header
     for key, value in (headers or {}).items():
         if key.lower() == "cookie" and value:
             lines.append(f"Cookie: {value}")
@@ -101,11 +102,27 @@ def build_request(method, path, headers=None, body=b"", host_ip=None, host_port=
     header_block = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8")
     return header_block + body_bytes
 
-def _outbound_dispatcher(raw_sock, local_port):
-    """
-    Background dispatcher thread reading from the dedicated outbound raw socket
-    and routing packets destined for local_port into the shared _packet_queues.
-    """
+def set_local_ip(ip):
+    global _local_ip
+    _local_ip = ip or None
+
+def _set_outbound_rst_block(local_port, add=True):
+    if platform.system() != "Linux":
+        return
+    subprocess.run(
+        [
+            "iptables",
+            "-A" if add else "-D",
+            "OUTPUT",
+            "-p", "tcp",
+            "--sport", str(local_port),
+            "--tcp-flags", "RST", "RST",
+            "-j", "DROP",
+        ],
+        check=False,
+    )
+
+def _outbound_dispatcher(raw_sock):
     raw_sock.settimeout(0.2)
     while True:
         try:
@@ -122,7 +139,8 @@ def _outbound_dispatcher(raw_sock, local_port):
                 continue
 
             src_port, dest_port = struct.unpack("!HH", tcp[:4])
-            if dest_port != local_port:
+            target_port = _active_local_port
+            if target_port is None or dest_port != target_port:
                 continue
 
             key = (socket.inet_ntoa(packet[12:16]), src_port)
@@ -137,46 +155,33 @@ def _outbound_dispatcher(raw_sock, local_port):
         except Exception as e:
             print(f"[Connection] Outbound dispatcher error: {e}")
 
-def _get_outbound_endpoint():
-    """
-    Initialize and reuse a single raw socket, an OS-reserved
-    ephemeral TCP port, and its packet dispatcher thread.
-    """
-    global _outbound_raw_socket, _outbound_guard_socket, _outbound_local_port, _outbound_dispatcher_thread
+def _get_outbound_raw_socket():
+    global _outbound_raw_socket, _outbound_dispatcher_thread
 
     with _outbound_lock:
         if _outbound_raw_socket is None:
-            guard_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            guard_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            guard_sock.bind(("0.0.0.0", 0))
-            local_port = guard_sock.getsockname()[1]
-
             raw_sock = create_raw_socket()
             dispatcher_thread = threading.Thread(
                 target=_outbound_dispatcher,
-                args=(raw_sock, local_port),
+                args=(raw_sock,),
                 daemon=True,
-                name=f"outbound-packet-dispatcher-{local_port}",
+                name="outbound-packet-dispatcher",
             )
             dispatcher_thread.start()
 
-            _outbound_guard_socket = guard_sock
             _outbound_raw_socket = raw_sock
-            _outbound_local_port = local_port
             _outbound_dispatcher_thread = dispatcher_thread
 
-        return _outbound_raw_socket, _outbound_local_port
+        return _outbound_raw_socket
 
-def connect_to_peer(target_ip, target_port):
+def connect_to_peer(target_ip, target_port, raw_socket, local_port):
     if not target_ip or target_port is None:
         raise ValueError("Target IP and port are required")
 
     target_port = int(target_port)
-    raw_socket, local_port = _get_outbound_endpoint()
     client_key = (target_ip, target_port)
-    local_ip = get_interface_ip()
+    local_ip = _local_ip or get_interface_ip()
 
-    # Clear any stale connection record or queued packets before sending SYN
     with connections_lock:
         connections.pop(client_key, None)
     remove_packet_queue(client_key)
@@ -223,7 +228,6 @@ def connect_to_peer(target_ip, target_port):
             local_next_seq = local_isn + 1
             remote_next_seq = remote_isn + 1
 
-            # Step 3: Send final ACK of 3-way handshake
             ack_tcp = build_tcp_packet(
                 local_ip, target_ip, local_port, target_port,
                 seq=local_next_seq, ack_seq=remote_next_seq, syn=0, ack=1
@@ -258,45 +262,63 @@ def send_request(method, path, headers=None, body=b"", ip=None, port=None):
 
     target_ip = ip
     target_port = int(port)
-    raw_socket, conn_info = connect_to_peer(target_ip, target_port)
+    global _active_local_port
 
-    try:
-        request = build_request(
-            method, path, headers=headers, body=body,
-            host_ip=target_ip, host_port=target_port
-        )
+    with _outbound_call_lock:
+        guard_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        guard_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        rst_blocked = False
+        local_port = None
+        raw_socket = None
+        conn_info = None
 
-        bytes_sent = run_conn_send(raw_socket, conn_info, request)
-        if bytes_sent < 0:
-            raise ConnectionError(f"Failed to send request to {target_ip}:{target_port}")
+        try:
+            guard_sock.bind(("0.0.0.0", 0))
+            local_port = guard_sock.getsockname()[1]
+            _set_outbound_rst_block(local_port, add=True)
+            rst_blocked = True
+            _active_local_port = local_port
 
-        response_buffer = bytearray()
-        while True:
-            chunk = run_conn_recv(raw_socket, conn_info)
-            if not chunk:
-                break
+            raw_socket = _get_outbound_raw_socket()
+            raw_socket, conn_info = connect_to_peer(target_ip, target_port, raw_socket, local_port)
 
-            response_buffer.extend(chunk)
-            if is_response_complete(response_buffer):
-                break
+            request = build_request(
+                method, path, headers=headers, body=body,
+                host_ip=target_ip, host_port=target_port
+            )
 
-        if not response_buffer:
-            raise ConnectionError(f"Empty response from {target_ip}:{target_port}")
+            bytes_sent = run_conn_send(raw_socket, conn_info, request)
+            if bytes_sent < 0:
+                raise ConnectionError(f"Failed to send request to {target_ip}:{target_port}")
 
-        return parse_response(bytes(response_buffer))
+            response_buffer = bytearray()
+            while True:
+                chunk = run_conn_recv(raw_socket, conn_info)
+                if not chunk:
+                    break
 
-    finally:
-        close_connection(raw_socket, conn_info)
+                response_buffer.extend(chunk)
+                if is_response_complete(response_buffer):
+                    break
+
+            if not response_buffer:
+                raise ConnectionError(f"Empty response from {target_ip}:{target_port}")
+
+            return parse_response(bytes(response_buffer))
+
+        finally:
+            if raw_socket is not None and conn_info is not None:
+                close_connection(raw_socket, conn_info)
+            _active_local_port = None
+            if rst_blocked:
+                _set_outbound_rst_block(local_port, add=False)
+            guard_sock.close()
 
 def is_response_complete(response_buffer: bytearray) -> bool:
-    """
-    Check whether a complete HTTP response has been received.
-    """
     header_end = response_buffer.find(b"\r\n\r\n")
     if header_end == -1:
         return False
 
-    # 2. Extract headers.
     header_data = response_buffer[:header_end]
     content_length = 0
 
@@ -312,7 +334,6 @@ def is_response_complete(response_buffer: bytearray) -> bool:
                 raise ValueError("Invalid Content-Length header")
             break
 
-    # 4. Calculate received body bytes.
     body_start = header_end + 4
     received_body_length = len(response_buffer) - body_start
     return received_body_length >= content_length

@@ -29,10 +29,11 @@ import socket
 import argparse
 
 from app import create_peerapp
+from start_backend import setup_rst_block
 
 PORT = 8001
 DEFAULT_TRACKER_IP = "127.0.0.1"
-DEFAULT_TRACKER_PORT = 8000
+DEFAULT_TRACKER_PORT = 2026
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -44,12 +45,20 @@ if __name__ == "__main__":
     parser.add_argument("--server-port", type=int, default=PORT)
     parser.add_argument("--tracker-ip", default=DEFAULT_TRACKER_IP)
     parser.add_argument("--tracker-port", type=int, default=DEFAULT_TRACKER_PORT)
+    parser.add_argument("--interface", default=None)
 
     args = parser.parse_args()
+    ip = args.server_ip
+    port = args.server_port
+
+    is_localhost = ip in ("127.0.0.1", "::1", "localhost") or ip.startswith("127.")
+    if not is_localhost:
+        setup_rst_block(ip, port)
 
     create_peerapp(
-        ip=args.server_ip,
-        port=args.server_port,
+        ip=ip,
+        port=port,
         tracker_ip=args.tracker_ip,
         tracker_port=args.tracker_port,
+        interface=args.interface,
     )

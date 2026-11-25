@@ -3,6 +3,7 @@ import time
 import uuid
 
 from daemon import StreapRous
+from daemon.backend import create_backend
 from app import peer, connection, tracker_client, p2p_client
 from streaprous_socket.streaprous_raw_connection import get_interface_ip
 
@@ -152,7 +153,7 @@ def get_list(headers, body):
 
 @app.route('/messages', methods=['GET'])
 def get_messages(headers, body):
-    return json_response({"messages": peer.drain_inbox_messages()}, 200)
+    return json_response({"messages": peer.get_message_history()}, 200)
 
 # -------- Peer APIs --------
 
@@ -196,7 +197,10 @@ def send_peer(headers, body):
     except Exception as e:
         return error(f"Cannot communicate with Peer: {e}", 502)
 
-    resp_data = read_body(content)
+    try:
+        resp_data = read_body(content)
+    except (UnicodeDecodeError, ValueError, TypeError, json.JSONDecodeError) as e:
+        return error(f"Invalid response from Peer: {e}", 502)
 
     if status_code != 200 or resp_data.get("status") != "ok":
         return error(resp_data.get("message", "Peer rejected the message"), 502)
@@ -257,7 +261,10 @@ def broadcast_peer(headers, body):
 
 @app.route('/p2p-message', methods=['POST'])
 def receive_p2p_message(headers, body):
-    data = read_body(body)
+    try:
+        data = read_body(body)
+    except (UnicodeDecodeError, ValueError, TypeError, json.JSONDecodeError) as e:
+        return error(f"Invalid request: {e}", 400)
 
     for field in ("id", "from_user", "scope", "text", "timestamp"):
         if field not in data:
@@ -283,13 +290,17 @@ def receive_p2p_message(headers, body):
     return json_response({"status": "ok", "id": message["id"]})
 
 
-def create_peerapp(ip, port, tracker_ip=None, tracker_port=None):
+def create_peerapp(ip, port, tracker_ip=None, tracker_port=None, interface=None):
     global PEER_IP, PEER_PORT
-    PEER_IP = get_interface_ip() if ip in (None, "", "0.0.0.0") else ip
+    PEER_IP = get_interface_ip(interface) if ip in (None, "", "0.0.0.0") else ip
     PEER_PORT = int(port)
+    connection.set_local_ip(PEER_IP)
 
     if tracker_ip is not None and tracker_port is not None:
         set_tracker(tracker_ip, tracker_port)
 
-    app.prepare_address(ip, port)
-    app.run()
+    if interface:
+        create_backend(ip, port, app.routes, interface)
+    else:
+        app.prepare_address(ip, port)
+        app.run()
