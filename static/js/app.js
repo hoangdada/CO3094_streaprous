@@ -88,8 +88,9 @@ async function handleReadyClick() {
   readyBtn.disabled = true;
   setMessage("");
 
+  const ip = window.location.hostname;
   const port = Number(window.location.port || 80);
-  const res = await apiSubmitInfo(port);
+  const res = await apiSubmitInfo(ip, port);
   readyBtn.disabled = false;
 
   if (res.status === 401) {

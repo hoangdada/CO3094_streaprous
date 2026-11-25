@@ -12,3 +12,4 @@
 
 from .sampleapp import create_sampleapp
 from .trackerapp import create_trackerapp
+from .peerapp import create_peerapp

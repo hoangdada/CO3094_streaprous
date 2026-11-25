@@ -1,7 +1,13 @@
 import json
+import time
+import uuid
 
 from daemon import StreapRous
 from app import peer, connection, tracker_client, p2p_client
+from streaprous_socket.streaprous_raw_connection import get_interface_ip
+
+PEER_IP = "127.0.0.1"
+PEER_PORT = 8001
 
 TRACKER_IP = "127.0.0.1"
 TRACKER_PORT = 8000
@@ -42,11 +48,22 @@ def valid_port(port):
         raise ValueError("Invalid port")
     return port
 
+def create_message(from_user, to_user, text, scope="unicast"):
+    return {
+        "id": "msg-" + uuid.uuid4().hex[:12],
+        "from_user": from_user,
+        "from_ip": PEER_IP,
+        "from_port": PEER_PORT,
+        "to_user": to_user,
+        "scope": scope,
+        "text": text,
+        "timestamp": int(time.time())
+    }
 
 # -------- Tracker APIs --------
 
 @app.route('/login', methods=['POST'])
-def login(headers, body, client_ip=None):
+def login(headers, body):
     global current_user
 
     try:
@@ -68,7 +85,7 @@ def login(headers, body, client_ip=None):
     return resp_headers, status_code, content
 
 @app.route('/submit-info', methods=['POST'])
-def submit_info(headers, body, client_ip=None):
+def submit_info(headers, body):
     try:
         return connection.send_request(
             method='POST',
@@ -82,7 +99,7 @@ def submit_info(headers, body, client_ip=None):
         return error(f"Cannot communicate with Tracker: {e}", 502)
 
 @app.route('/logout', methods=['POST'])
-def logout(headers, body, client_ip=None):
+def logout(headers, body):
     global current_user
 
     try:
@@ -99,11 +116,12 @@ def logout(headers, body, client_ip=None):
 
     if status_code == 200:
         current_user = None
+        peer.clear_connected_peers()
 
     return resp_headers, status_code, content
 
 @app.route('/peer-list', methods=['GET'])
-def get_list(headers, body, client_ip=None):
+def get_list(headers, body):
     try:
         resp_headers, status_code, content = connection.send_request(
             method='GET',
@@ -118,62 +136,38 @@ def get_list(headers, body, client_ip=None):
     if status_code != 200:
         return resp_headers, status_code, content
 
-    directory = json.loads(content.decode("utf-8"))
-    raw_peers = directory.get("peers", {}) if isinstance(directory, dict) else directory
+    try:
+        directory = json.loads(content.decode("utf-8"))
+        raw_peers = directory.get("peers", {}) if isinstance(directory, dict) else directory
+        synced_peers = peer.sync_peer(raw_peers)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as e:
+        return error(f"Invalid peer list from Tracker: {e}", 502)
 
-    if isinstance(raw_peers, dict):
-        peers = [
-            {"username": uname, **info}
-            for uname, info in raw_peers.items()
-        ]
-    else:
-        peers = list(raw_peers)
+    for item in synced_peers:
+        item["connected"] = True
 
-    connected = peer.get_connected_peers()
-    for item in peers:
-        item["connected"] = any(
-            p["ip"] == item["ip"] and p["port"] == int(item["port"])
-            for p in connected
-        )
+    return json_response({"peers": synced_peers}, 200)
 
-    return json_response({"peers": peers}, 200)
+# -------- Browser APIs --------
 
 @app.route('/messages', methods=['GET'])
-def get_messages(headers, body, client_ip=None):
+def get_messages(headers, body):
     return json_response({"messages": peer.drain_inbox_messages()}, 200)
 
 # -------- Peer APIs --------
 
-@app.route('/connect-peer/', methods=['POST'])
-def connect_peer(headers, body):
-    data = read_body(body)
-
-    ip = data["ip"]
-    port = valid_port(data["port"])
-
-    raw_socket, conn_info = p2p_client.connect_to_peer(ip, port)
-
-    from streaprous_socket.streaprous_raw_connection import close_connection
-    close_connection(raw_socket, conn_info)
-
-    peer.connect_peer(data.get("username", ip), ip, port)
-
-    return {
-        "status": "connected",
-        "ip": ip,
-        "port": port
-    }
-
-
-@app.route('/send-peer/', methods=['POST'])
+@app.route('/send-peer', methods=['POST'])
 def send_peer(headers, body):
     if not current_user:
         return error("Please login first", 401)
 
-    data = read_body(body)
-    ip = data["target_ip"]
-    port = valid_port(data["target_port"])
-    text = data["message"]
+    try:
+        data = read_body(body)
+        ip = data["target_ip"]
+        port = valid_port(data["target_port"])
+        text = data["message"]
+    except (KeyError, ValueError, TypeError, json.JSONDecodeError) as e:
+        return error(f"Invalid request: {e}", 400)
 
     if not isinstance(text, str) or not text.strip():
         return error("Message cannot be empty")
@@ -189,48 +183,79 @@ def send_peer(headers, body):
     if target is None:
         return error("Peer is not connected")
 
-    result = p2p_client.send_message(
-        ip, port, current_user, target["username"], text
-    )
+    message_body = create_message(current_user, target["username"], text, "unicast")
 
-    peer.save_sent_message(result["message"])
+    try:
+        _, status_code, content = connection.send_request(
+            method='POST',
+            path='/p2p-message',
+            body=message_body,
+            ip=ip,
+            port=port
+        )
+    except Exception as e:
+        return error(f"Cannot communicate with Peer: {e}", 502)
 
-    return {
+    resp_data = read_body(content)
+
+    if status_code != 200 or resp_data.get("status") != "ok":
+        return error(resp_data.get("message", "Peer rejected the message"), 502)
+
+    peer.save_sent_message(message_body)
+
+    return json_response({
         "status": "sent",
-        "id": result["id"],
-        "timestamp": result["timestamp"]
-    }
+        "id": message_body["id"],
+        "timestamp": message_body["timestamp"]
+    }, 200)
 
 
-@app.route('/broadcast-peer/', methods=['POST'])
+@app.route('/broadcast-peer', methods=['POST'])
 def broadcast_peer(headers, body):
     if not current_user:
         return error("Please login first", 401)
 
-    data = read_body(body)
-    text = data["message"]
+    try:
+        data = read_body(body)
+        text = data["message"]
+    except (KeyError, ValueError, TypeError, json.JSONDecodeError) as e:
+        return error(f"Invalid request: {e}", 400)
 
     if not isinstance(text, str) or not text.strip():
         return error("Message cannot be empty")
 
-    result = p2p_client.broadcast_message(
-        peer.get_connected_peers(), current_user, text
-    )
+    message_body = create_message(current_user, None, text, "broadcast")
+    count = 0
 
-    if result["count"] > 0:
-        peer.save_sent_message(result["message"])
+    for target in peer.get_connected_peers():
+        try:
+            _, status_code, content = connection.send_request(
+                method='POST',
+                path='/p2p-message',
+                body=message_body,
+                ip=target["ip"],
+                port=target["port"]
+            )
+            resp_data = read_body(content)
+            if status_code == 200 and resp_data.get("status") == "ok":
+                count += 1
+        except Exception as e:
+            print(f"[PeerApp] Cannot broadcast to {target['username']}: {e}")
 
-    return {
+    if count > 0:
+        peer.save_sent_message(message_body)
+
+    return json_response({
         "status": "broadcasted",
-        "count": result["count"],
-        "id": result["id"],
-        "timestamp": result["timestamp"]
-    }
+        "count": count,
+        "id": message_body["id"],
+        "timestamp": message_body["timestamp"]
+    }, 200)
 
 
 # -------- Incoming P2P --------
 
-@app.route('/p2p-message/', methods=['POST'])
+@app.route('/p2p-message', methods=['POST'])
 def receive_p2p_message(headers, body):
     data = read_body(body)
 
@@ -255,9 +280,16 @@ def receive_p2p_message(headers, body):
         data["timestamp"]
     )
 
-    return {"status": "ok", "id": message["id"]}
+    return json_response({"status": "ok", "id": message["id"]})
 
 
-def create_peerapp(ip, port):
+def create_peerapp(ip, port, tracker_ip=None, tracker_port=None):
+    global PEER_IP, PEER_PORT
+    PEER_IP = get_interface_ip() if ip in (None, "", "0.0.0.0") else ip
+    PEER_PORT = int(port)
+
+    if tracker_ip is not None and tracker_port is not None:
+        set_tracker(tracker_ip, tracker_port)
+
     app.prepare_address(ip, port)
     app.run()

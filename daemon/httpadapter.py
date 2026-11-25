@@ -99,7 +99,7 @@ class HttpAdapter:
         #: raw socket for streaprous communication
         self.raw_socket = None
 
-    def _dispatch_request(self, raw_bytes, routes, client_ip):
+    def _dispatch_request(self, raw_bytes, routes):
         """
         Parse the buffered HTTP request, invoke the matched route hook if any,
         and construct the HTTP response bytes via Request and Response.
@@ -114,7 +114,6 @@ class HttpAdapter:
             response_headers, status_code, content = req.hook(
                 headers=req.headers,
                 body=req.body,
-                client_ip=client_ip
             )
 
             response = resp.build_response(
@@ -142,7 +141,6 @@ class HttpAdapter:
         """
         self.conn = conn
         self.connaddr = addr
-        client_ip = addr[0] if addr else None
 
         print("[HttpAdapter] Invoke handle_client connection {}".format(addr))
        
@@ -159,7 +157,7 @@ class HttpAdapter:
                 if is_request_complete(data):
                     break
 
-            response = self._dispatch_request(data, routes, client_ip)
+            response = self._dispatch_request(data, routes)
 
         except Exception as e:
             print("[HttpAdapter] Error handling client {}: {}".format(addr, e))
@@ -203,7 +201,7 @@ class HttpAdapter:
                 if is_request_complete(data):
                     break
 
-            response = self._dispatch_request(data, routes, conn_info.client_ip)
+            response = self._dispatch_request(data, routes)
 
         except Exception as e:
             print("[HttpAdapter] Error handling raw client {}:{}: {}".format(conn_info.client_ip, conn_info.client_port, e))

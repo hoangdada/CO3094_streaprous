@@ -93,7 +93,7 @@ def require_authentication(func):
     return wrapper
 
 @app.route('/login', methods=['POST'])
-def login(headers="guest", body="anonymous",  client_ip=None):
+def login(headers="guest", body="anonymous"):
     print("[SampleApp] Logging in {} to {}".format(headers, body))
 
     response_headers = {}
@@ -133,15 +133,19 @@ def login(headers="guest", body="anonymous",  client_ip=None):
 
 @app.route('/submit-info', methods=['POST'])
 @require_authentication
-def submit_info(headers=None, body=None, username=None, client_ip=None):
+def submit_info(headers=None, body=None, username=None):
     try:
         data = parse_json_body(body)
+        ip = data.get("ip")
         port = data.get("port")
 
     except (AttributeError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return json_response({"message": "Invalid request body"}, 400)
 
-    # Validate port
+    # Validate ip & port
+    if not isinstance(ip, str) or not ip.strip():
+        return json_response({"message": "Invalid IP address"}, 400)
+
     if type(port) is not int or not (1 <= port <= 65535):
         return json_response({"message": "Invalid listening port"}, 400)
 
@@ -149,7 +153,7 @@ def submit_info(headers=None, body=None, username=None, client_ip=None):
         is_new = username not in peers
         peers[username] = {
             "username": username,
-            "ip": client_ip,
+            "ip": ip,
             "port": port
         }
 
@@ -161,12 +165,12 @@ def submit_info(headers=None, body=None, username=None, client_ip=None):
         status_code = 200
         message = "Peer information updated successfully"
 
-    print("[TrackerApp] Registered peer {} at {}:{}".format(username, client_ip, port))
+    print("[TrackerApp] Registered peer {} at {}:{}".format(username, ip, port))
     return json_response(
         {
             "message": message,
             "username": username,
-            "ip": client_ip,
+            "ip": ip,
             "port": port
         },
         status_code=status_code
@@ -174,7 +178,7 @@ def submit_info(headers=None, body=None, username=None, client_ip=None):
 
 @app.route('/logout', methods=['POST'])
 @require_authentication
-def logout(headers=None, body=None, username=None, client_ip=None):
+def logout(headers=None, body=None, username=None):
     session_id = get_session_id(headers)
 
     with state_lock:
@@ -190,7 +194,7 @@ def logout(headers=None, body=None, username=None, client_ip=None):
 
 @app.route('/peer-list', methods=['GET'])
 @require_authentication 
-def peer_list(headers=None, body=None, username=None, client_ip=None):
+def peer_list(headers=None, body=None, username=None):
     with state_lock:
         peer_snapshot = {
             peer_username: peer_info.copy()
