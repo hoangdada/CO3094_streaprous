@@ -52,6 +52,17 @@ conn_struct = namedtuple('conn_struct', [
     'expected_final_ack',
     'last_activity'
 ])
+class seg_struct:
+    def __init__(self, seq, payload):
+        self.seq = seq
+        self.payload = payload
+        self.acked = False
+        self.sent_at = 0.0
+        self.retries = 0
+        self.fast_resent = False
+    @property
+    def end(self):
+        return self.seq + len(self.payload)
 
 
 # Global table to manage multiple connection
@@ -66,10 +77,23 @@ handshake_lock = threading.Lock()
 handshake_in_progress = {}
 
 
+RECEIVER_IDLE_TIMEOUT = 60
+RECEIVE_CAP = 5840 #flow receive window
+MESSAGE_SIZE = 1000
+SEND_WINDOW = 4 
+RETRANSMISSION_TIMEOUT = 2.0
+MAX_RETRIES = 5
+#selective_recv
+_early_segments = {}
+_congestion_windows = {}
+
+
+
 # Default raw port listener
 DEFAULT_LISTEN_IP = "0.0.0.0"
 DEFAULT_LISTEN_PORT = 22239
 DEFAULT_INTERFACE_NAME = "lo0"
+
 
 def register_keep_port_alive(listen_ip="0.0.0.0", listen_port=22239, retry_interval=10):
     """
@@ -141,7 +165,7 @@ def checksum(msg):
     return ~s & 0xffff
 
 
-def build_tcp_packet(src_ip, dest_ip, src_port, dst_port, seq, ack_seq, syn=0, ack=0, fin=0, window=None):
+def build_tcp_packet(src_ip, dest_ip, src_port, dst_port, seq, ack_seq, syn=0, ack=0, fin=0, window=None, options = b""):
     """Stitches a structurally flawless 20-byte TCP header.
 
     Args:
@@ -154,18 +178,24 @@ def build_tcp_packet(src_ip, dest_ip, src_port, dst_port, seq, ack_seq, syn=0, a
          syn=0     SYN flag
          ack=0     ACK flag
          fin=0     FIN flag
+         options   TCP options
     """
     flags = (ack << 4) + (syn << 1) + fin
-    offset_res = (5 << 4) + 0  # 20 bytes data offset (5 * 4)
     # window = 5840
     urg_ptr = 0
     draft_checksum = 0
     if window is None: window = RECEIVE_CAP
+    # Options need to be multiply of 4 bytes
+    while len(options) % 4 != 0:
+        options += b'\x00'
+    header_len = 20 + len(options)
+    offset_res = (header_len // 4) << 4 # 20 bytes header + options 
+    
     # Build a draft (20 byte) header with no checksum
     tcp_header_temp = struct.pack('!HHLLBBHHH',
         src_port, dst_port, seq, ack_seq,
         offset_res, flags, window, draft_checksum, urg_ptr
-    )
+    ) + options
     
     # Build addressing-header
     address_header = struct.pack('!4s4sBBH',
@@ -180,9 +210,9 @@ def build_tcp_packet(src_ip, dest_ip, src_port, dst_port, seq, ack_seq, syn=0, a
     tcp_header = struct.pack('!HHLLBBHHH',
         src_port, dst_port, seq, ack_seq,
         offset_res, flags, window, tcp_checksum, urg_ptr
-    )
+    ) 
     
-    return tcp_header
+    return tcp_header + options
 
 
 def build_ip_header(src_ip, dest_ip, protocol, payload_len):
@@ -370,6 +400,55 @@ def get_interface_ip(interface_name: str = None) -> str:
         return ip
     except Exception:
         return "127.0.0.1"
+
+def make_sack_options(blocks):
+    """
+        This option contains a list of some of the blocks of contiguous sequence space occupied by data that has been received and queued within the window.
+        blocks = [(left edge of 1st block , right edge of 1st block),...,(left edge of nth block,right edge of nth block) ]
+    """
+    if not blocks:
+        return b""
+    blocks = blocks[:4]
+    data =  bytes([5, 8*len(blocks) +2]) 
+    for left, right in blocks:
+        data += struct.pack('!II', left, right)
+    return data
+def read_sack_blocks(tcp_packet):
+    if not tcp_packet:
+        return []
+
+    header_len = (tcp_packet[12]>>4) *4
+    options = tcp_packet[20:header_len]
+    blocks = []
+    
+    i = 0
+    while i < len(options):
+        kind = options[i]
+        # EOL
+        if kind == 0:
+            break
+        # NOP
+        if kind ==1:
+            i+=1
+            continue
+        if kind == 5:
+            length = options[i+1]
+            for j in range(i+2,i+length,8):
+                blocks.append(struct.unpack('!II', options[j:j+8]))
+        i+=length
+    return blocks
+        
+def get_sack_blocks(client_key):
+    buffered = _early_segments.get(client_key, {})
+    blocks = []
+    for seq in sorted(buffered):
+        if blocks and seq == blocks[-1][1]:
+            blocks[-1] = (blocks[-1][0], seq + 1)
+        else:
+            blocks.append((seq, seq+1))
+    # Note: Only take 4 first blocks because the options fields max is 40 byte but every blocks need to be 8 bytes and 2 NOP at the beginning so at most 4 blocks
+    return blocks[:4]
+    
 
 
 def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: str = None) -> conn_struct:
@@ -618,18 +697,7 @@ def accept(s: socket.socket, listen_ip: str, listen_port: int, interface_name: s
             handshake_in_progress.clear()
         raise
 
-#im gonna do selective repeat for reliability
-#some func + const
-#DISCLAIMER!!!!!!!!!!!!!!!: i did intentionally add the ADDED to maintain the code cuz the provided code  and my code living in the same so, that is not AI...
-RECEIVER_IDLE_TIMEOUT = 60
-RECEIVE_CAP = 5840 #flow receive window
-MESSAGE_SIZE = 1000
-SEND_WINDOW = 4 
-RETRANSMISSION_TIMEOUT = 2.0
-MAX_RETRIES = 5
-#selective_recv
-_early_segments = {}
-_congestion_windows = {}
+
 def _load_connection_record(connection_key):
     with connections_lock: return connections.get(connection_key)
 
@@ -642,8 +710,9 @@ def _forget_connection(connection_key):
 def _send_pure_ack(raw_socket, connection_record, ack_number):
     client_key = (connection_record.client_ip, connection_record.client_port)
     window = _free_receive_window(client_key)
+    options = make_sack_options(get_sack_blocks(client_key))
     tcp_header = build_tcp_packet(connection_record.server_ip, connection_record.client_ip, connection_record.server_port, connection_record.client_port, 
-                                  connection_record.server_seq,  ack_seq=ack_number, ack = 1, window=window)
+                                  connection_record.server_seq,  ack_seq=ack_number, ack = 1, window=window, options = options)
     ip_header = build_ip_header(connection_record.server_ip, connection_record.client_ip, socket.IPPROTO_TCP, len(tcp_header))
     raw_socket.sendto(ip_header + tcp_header, (connection_record.client_ip, 0))
 
@@ -824,11 +893,13 @@ def run_conn_recv(s: socket.socket, conn_info: conn_struct) -> bytes:
                     #     app_payload += buffered_payload
                     #     next_ack  += len(buffered_payload)
 
-                    ack_packet = build_tcp_packet(session.server_ip, client_ip, listen_port, client_port,
-                                                  seq=session.server_seq, ack_seq=next_ack, ack=1,  window=_free_receive_window(client_key))
-                    ip_header = build_ip_header(session.server_ip, client_ip, socket.IPPROTO_TCP, len(ack_packet))
-                    s.sendto(ip_header + ack_packet, (client_ip, 0))
+                    # ack_packet = build_tcp_packet(session.server_ip, client_ip, listen_port, client_port,
+                    #                               seq=session.server_seq, ack_seq=next_ack, ack=1,  window=_free_receive_window(client_key))
+                    # ip_header = build_ip_header(session.server_ip, client_ip, socket.IPPROTO_TCP, len(ack_packet))
+                    # s.sendto(ip_header + ack_packet, (client_ip, 0))
+                    _send_pure_ack(s, session, next_ack)
                     print(f"[Streap_raw] Sent ACK for data (Ack={next_ack})")
+                    
                     
                     # Update sequence numbers AFTER ACK sent
                     with connections_lock:
@@ -888,138 +959,256 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
         session = connections[client_key]
     
     try:
+        
+        
         #ADDED 1: chop into segments-timers pair
-        segments = [payload[i:i + MESSAGE_SIZE] for i in range(0, len(payload), MESSAGE_SIZE)]
-        sent_at =  [0.0 for _ in range(0, len(segments))]
-        retries  =  [0 for _ in range(0, len(segments))]
+        # segments = [payload[i:i + MESSAGE_SIZE] for i in range(0, len(payload), MESSAGE_SIZE)]
+        # acked = [False] * len(segments)
+        # sent_at =  [0.0 for _ in range(0, len(segments))]
+        # retries  =  [0 for _ in range(0, len(segments))]
+        # highest_ack = session.server_seq # initialize the highest ack to send
+        # acked = [False for _ in range(0, len(segments))]
+        
+        
+        
+        
+        segments = []
+        seq = session.server_seq
+        for i in range(0, len(payload), MESSAGE_SIZE):
+            chunk = payload[i:i+MESSAGE_SIZE]
+            segments.append(seg_struct(seq, chunk))
+            seq += len(chunk)
+        
         oldest_unacked = 0 #first unacked
         next_to_send = 0  #first never be sent
-        highest_ack = session.server_seq # initialize the highest ack to send
-        
+        last_ack = session.server_seq
+        highest_sent = session.server_seq
+        rwnd = MESSAGE_SIZE
+
         # Congestion Window 
         "Adding state for the congestion window"
-        last_ack = session.server_seq
         cwnd = 1.0
         ssthresh = (64*1024)/MESSAGE_SIZE
-        duplicate_acks = 0
-        in_fast_recovery = False
+        in_recovery = False
+        recovery_point = last_ack
         
-        
+        # Get packet queue
         packet_queue  = get_packet_queue(client_key)
         rwnd = MESSAGE_SIZE
-        #ADDED2: while lop forsend all the chopped
-        while(oldest_unacked < len(segments)):
-            # allowed_window = max(1, min(SEND_WINDOW, rwnd//MESSAGE_SIZE))
-            send_limit = min(int(cwnd * MESSAGE_SIZE),rwnd)
-            while next_to_send < len(segments):
-                # in-flight segments too much
-                if next_to_send - oldest_unacked >= SEND_WINDOW:
-                    break
-                
-                segment = segments[next_to_send]
-                bytes_in_flight = highest_ack - last_ack
-                
-                if bytes_in_flight + len(segment) > send_limit:
-                    break
-                
-                send_tcp_data_segment(
-                s, listen_ip, client_ip, listen_port, client_port,
-                seq=session.server_seq + next_to_send*MESSAGE_SIZE, ack_seq=session.client_seq, payload=segments[next_to_send]
-            )
-                #update the highest ack after segment sending 
-                highest_ack += len(segments[next_to_send])
-                sent_at[next_to_send] = time.time()
+        
+        def send_seg(seg):
+            send_tcp_data_segment(s, listen_ip, client_ip, listen_port, client_port,
+                                  seq=seg.seq, ack_seq=session.client_seq,
+                                  payload=seg.payload)
+            seg.sent_at = time.time()
+        
+        while oldest_unacked < len(segments):
+            in_flight = sum(1 for seg in segments[oldest_unacked:next_to_send] if not seg.acked)
+            while (next_to_send < len(segments)) and in_flight < int(cwnd) and segments[next_to_send].end <= last_ack+rwnd:
+                seg = segments[next_to_send]
+                send_seg(seg)
+                highest_sent = max(highest_sent, seg.end)
                 next_to_send += 1
+                in_flight += 1
 
-            #timer 
-            #modify: reduce congestion window while being timed out
-            i = oldest_unacked
-            if i < next_to_send:
-                waiting_time = time.time() - sent_at[i]
-                if waiting_time > RETRANSMISSION_TIMEOUT:
-                    if retries[i] >= MAX_RETRIES:
-                        print(f"[Streap_raw] run_conn_send Segment {i} gave up  to {client_ip}:{client_port}")
+            # 2. TIMEOUT: resend un-acked segments that waited too long
+            for seg in segments[oldest_unacked:next_to_send]:
+                if not seg.acked and time.time() - seg.sent_at > RETRANSMISSION_TIMEOUT:
+                    if seg.retries >= MAX_RETRIES:
+                        print(f"[Streap_raw] run_conn_send Segment seq={seg.seq} gave up to {client_ip}:{client_port}")
                         return -1
-                    ssthresh = max(2.0, cwnd/2)
-                    cwnd = 1.0
-                    duplicate_acks = 0
-                    in_fast_recovery = False
-                    send_tcp_data_segment(
-                        s, listen_ip, client_ip, listen_port, client_port,
-                        seq=session.server_seq + i*MESSAGE_SIZE, ack_seq=session.client_seq, payload=segments[i]
-                    )
-                    sent_at[i] = time.time()
-                    retries[i]  += 1
+                    if seg is segments[oldest_unacked]:     # timeout = serious congestion
+                        ssthresh = max(2.0, cwnd / 2)
+                        cwnd = 1.0
+                        in_recovery = False
+                    send_seg(seg)
+                    seg.retries += 1
+                    seg.fast_resent = False
 
-            #wait ack 
+            # 3. RECEIVE one ACK
             try:
                 packet, addr = packet_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
             ihl = (packet[0] & 0x0F) * 4
             tcp_packet = packet[ihl:]
-            tcp_header_len = (tcp_packet[12] >> 4) * 4
             if len(tcp_packet) < 20:
                 continue
             tcph = struct.unpack('!HHLLBBHHH', tcp_packet[:20])
             pkt_ack, flags = tcph[3], tcph[5]
 
-            if flags & 0x04:
-                print(f"[Streap_raw] run_conn_send Sent RST bytes to {client_ip}:{client_port}")
+            if flags & 0x04:                        # RST
+                print(f"[Streap_raw] run_conn_send Received RST from {client_ip}:{client_port}")
                 return -1
-            if not (flags &  0x10):  #ack
+            if not (flags & 0x10):                  # not an ACK
                 continue
-            #cap the highest_ack 
-            if pkt_ack < last_ack or pkt_ack > highest_ack:
+            if pkt_ack < last_ack or pkt_ack > highest_sent:
                 continue
-            
             rwnd = tcph[6]
-            if pkt_ack == last_ack:
-                has_payload = len(tcp_packet) > tcp_header_len
-                if oldest_unacked == next_to_send or has_payload:
-                    continue
-                duplicate_acks += 1
-                if in_fast_recovery:
-                    cwnd +=1
-                elif duplicate_acks == 3:
-                    ssthresh = max(2.0, cwnd/2)
-                    cwnd = ssthresh + 3.0
-                    in_fast_recovery = True
-                    
-                    i = oldest_unacked
-                    send_tcp_data_segment(s, listen_ip, client_ip, listen_port, client_port,
-                                          seq=session.server_seq+i*MESSAGE_SIZE,
-                                          ack_seq=session.client_seq,
-                                          payload=segments[i]
-                                          )
-                    sent_at[i] = time.time()
-                continue
-            last_ack = pkt_ack
-            duplicate_acks = 0
-            if in_fast_recovery:
-                cwnd = ssthresh 
-                in_fast_recovery = False
-            elif cwnd < ssthresh:
-                cwnd+=1.0
-            else:
-                cwnd +=1/cwnd
+
+            # 4a. Cumulative ACK
+            if pkt_ack > last_ack:
+                last_ack = pkt_ack
+                if in_recovery:
+                    if last_ack >= recovery_point:  # lost data repaired
+                        in_recovery = False
+                        cwnd = ssthresh
+                elif cwnd < ssthresh:
+                    cwnd += 1.0                     # slow start
+                else:
+                    cwnd += 1.0 / cwnd              # congestion avoidance
+                for seg in segments[oldest_unacked:next_to_send]:
+                    if seg.end <= pkt_ack:
+                        seg.acked = True
+
+            # 4b. SACK blocks
+            for left, right in read_sack_blocks(tcp_packet):
+                for seg in segments[oldest_unacked:next_to_send]:
+                    if left <= seg.seq and seg.end <= right:
+                        seg.acked = True
+
+            # 5. Slide the window past acked segments
+            while oldest_unacked < next_to_send and segments[oldest_unacked].acked:
+                oldest_unacked += 1
+
+            # 6. Fast resend: a hole with 3+ SACKed segments above it
+            sacked_above = 0
+            for seg in reversed(segments[oldest_unacked:next_to_send]):
+                if seg.acked:
+                    sacked_above += 1
+                elif sacked_above >= 3 and not seg.fast_resent:
+                    if not in_recovery:             # cut cwnd once per loss event
+                        ssthresh = max(2.0, cwnd / 2)
+                        cwnd = ssthresh
+                        in_recovery = True
+                        recovery_point = highest_sent
+                    send_seg(seg)
+                    seg.fast_resent = True
+
+        # (keep your existing lines below, unchanged)
+        bytes_sent = len(payload)
+        
+        
+        
+        
+        
+        #ADDED2: while lop forsend all the chopped
+        # segment_pointer = oldest_unacked
+        # while(segment_pointer < len(segments)):
+        #     # allowed_window = max(1, min(SEND_WINDOW, rwnd//MESSAGE_SIZE))
+        #     send_limit = min(int(cwnd * MESSAGE_SIZE),rwnd)
             
-            while oldest_unacked < next_to_send:
-                segment_start = session.server_seq +oldest_unacked * MESSAGE_SIZE
-                segment_end = segment_start + len(segments[oldest_unacked])
-                if pkt_ack <segment_end:
-                    break
-                oldest_unacked +=1
-            if oldest_unacked < next_to_send:
-                sent_at[oldest_unacked] = time.time()
-            print(f"[FLOW_CONTROL] client window rwnd={rwnd}")
-        #  bytes_sent = send_tcp_data_segment(
-        #     s, listen_ip, client_ip, listen_port, client_port,
-        #     seq=session.server_seq, ack_seq=session.client_seq, payload=payload
-        #  )
-        #     bytes_acked = pkt_ack - session.server_seq
-        #     while oldest_unacked <len(segments) and oldest_unacked*MESSAGE_SIZE + len(segments[oldest_unacked]) <= bytes_acked:
-        #         oldest_unacked += 1
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               
+             
+        #     # while next_to_send < len(segments):
+        #     #     # in-flight segments too much
+        #     #     if next_to_send - oldest_unacked >= SEND_WINDOW:
+        #     #         break
+                
+        #     #     segment = segments[next_to_send]
+        #     #     bytes_in_flight = highest_ack - last_ack
+                
+        #     #     if bytes_in_flight + len(segment) > send_limit:
+        #     #         break
+                
+        #     #     send_tcp_data_segment(
+        #     #     s, listen_ip, client_ip, listen_port, client_port,
+        #     #     seq=session.server_seq + next_to_send*MESSAGE_SIZE, ack_seq=session.client_seq, payload=segments[next_to_send]
+        #     # )
+        #         #update the highest ack after segment sending 
+        #         highest_ack += len(segments[next_to_send])
+        #         sent_at[next_to_send] = time.time()
+        #         next_to_send += 1
+
+        #     #timer 
+        #     #modify: reduce congestion window 
+        #     i = oldest_unacked
+        #     if i < next_to_send:
+        #         waiting_time = time.time() - sent_at[i]
+        #         if waiting_time > RETRANSMISSION_TIMEOUT:
+        #             if retries[i] >= MAX_RETRIES:
+        #                 print(f"[Streap_raw] run_conn_send Segment {i} gave up  to {client_ip}:{client_port}")
+        #                 return -1
+        #             ssthresh = max(2.0, cwnd/2)
+        #             cwnd = 1.0
+        #             duplicate_acks = 0
+        #             in_fast_recovery = False
+        #             send_tcp_data_segment(
+        #                 s, listen_ip, client_ip, listen_port, client_port,
+        #                 seq=session.server_seq + i*MESSAGE_SIZE, ack_seq=session.client_seq, payload=segments[i]
+        #             )
+        #             sent_at[i] = time.time()
+        #             retries[i]  += 1
+
+        #     #wait ack 
+        #     try:
+        #         packet, addr = packet_queue.get(timeout=0.1)
+        #     except queue.Empty:
+        #         continue
+        #     ihl = (packet[0] & 0x0F) * 4
+        #     tcp_packet = packet[ihl:]
+        #     tcp_header_len = (tcp_packet[12] >> 4) * 4
+        #     if len(tcp_packet) < 20:
+        #         continue
+        #     tcph = struct.unpack('!HHLLBBHHH', tcp_packet[:20])
+        #     pkt_ack, flags = tcph[3], tcph[5]
+
+        #     if flags & 0x04:
+        #         print(f"[Streap_raw] run_conn_send Sent RST bytes to {client_ip}:{client_port}")
+        #         return -1
+        #     if not (flags &  0x10):  #ack
+        #         continue
+        #     #cap the highest_ack 
+        #     if pkt_ack < last_ack or pkt_ack > highest_ack:
+        #         continue
+            
+        #     rwnd = tcph[6]
+        #     if pkt_ack == last_ack:
+        #         has_payload = len(tcp_packet) > tcp_header_len
+        #         if oldest_unacked == next_to_send or has_payload:
+        #             continue
+        #         duplicate_acks += 1
+        #         if in_fast_recovery:
+        #             cwnd +=1
+        #         elif duplicate_acks == 3:
+        #             ssthresh = max(2.0, cwnd/2)
+        #             cwnd = ssthresh + 3.0
+        #             in_fast_recovery = True
+                    
+        #             i = oldest_unacked
+        #             send_tcp_data_segment(s, listen_ip, client_ip, listen_port, client_port,
+        #                                   seq=session.server_seq+i*MESSAGE_SIZE,
+        #                                   ack_seq=session.client_seq,
+        #                                   payload=segments[i]
+        #                                   )
+        #             sent_at[i] = time.time()
+        #         continue
+        #     last_ack = pkt_ack
+        #     duplicate_acks = 0
+        #     if in_fast_recovery:
+        #         cwnd = ssthresh 
+        #         in_fast_recovery = False
+        #     elif cwnd < ssthresh:
+        #         cwnd+=1.0
+        #     else:
+        #         cwnd +=1/cwnd
+            
+        #     while oldest_unacked < next_to_send:
+        #         segment_start = session.server_seq +oldest_unacked * MESSAGE_SIZE
+        #         segment_end = segment_start + len(segments[oldest_unacked])
+        #         if pkt_ack <segment_end:
+        #             break
+        #         oldest_unacked +=1
+        #     if oldest_unacked < next_to_send:
+        #         sent_at[oldest_unacked] = time.time()
+        #     print(f"[FLOW_CONTROL] client window rwnd={rwnd}")
+        # #  bytes_sent = send_tcp_data_segment(
+        # #     s, listen_ip, client_ip, listen_port, client_port,
+        # #     seq=session.server_seq, ack_seq=session.client_seq, payload=payload
+        # #  )
+        # #     bytes_acked = pkt_ack - session.server_seq
+        # #     while oldest_unacked <len(segments) and oldest_unacked*MESSAGE_SIZE + len(segments[oldest_unacked]) <= bytes_acked:
+        # #         oldest_unacked += 1
 
         bytes_sent = len(payload)
         print(f"[Streap_raw] run_conn_send Sent {bytes_sent} bytes to {client_ip}:{client_port}")

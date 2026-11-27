@@ -133,6 +133,7 @@ class HttpAdapter:
                 #
                 # TODO: handle for App hook here
                 #
+                
                 response = b""
             else:
                 # Build response
@@ -141,7 +142,7 @@ class HttpAdapter:
             print("[HttpAdapter] Error building response: {}".format(e))
             response = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"
 
-        #print("[HttpAdapter] Response content {}".format(response))
+        print("[HttpAdapter] Response content {}".format(response))
         conn.sendall(response)
         conn.close()
 
@@ -191,6 +192,7 @@ class HttpAdapter:
         #
         # TODO run_conn_send packet
         # run_conn_send(..)
+        run_conn_send(self.raw_socket, self.conn_info,response)
         
         # Wait longer to ensure response is transmitted, client processes it, and sends ACK
         import time
@@ -200,6 +202,7 @@ class HttpAdapter:
         #
         # TODO run_conn_send packet
         # close_connection(...)
+        close_connection(self.raw_socket,self.conn_info)
 
     async def handle_client_coroutine(self, reader, writer):
         """
