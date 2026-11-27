@@ -1,16 +1,36 @@
 <!doctype html>
 <html>
 <head>
-    <title>bksysnet@hcmut welcome</title>
-
+  <title>bksysnet@hcmut homepage</title>
+  <link rel="stylesheet" href="/css/styles.css">
 </head>
 
 <body>
-<div>
-    <h1>bksysnet@hcmut  Domain</h1>
-    <p>This domain is for use in illustrative examples in documents.
-    </p>
-  
-</div>
+<main>
+  <h1>bksysnet@hcmut - Homepage</h1>
+  <p>User: <strong id="current-user">-</strong></p>
+  <p>Peer: <span id="my-peer-info">Not registered</span></p>
+  <div>
+    <button id="ready-btn" type="button">Ready</button> 
+    <button id="refresh-btn" type="button">Refresh</button> 
+    <button id="logout-btn" type="button">Logout</button></div>
+  <p id="app-message"></p>
+  <h2>Active Peers</h2>
+  <ul id="peer-list"></ul>
+  <h2>P2P Chat</h2>
+  <div>
+    <select id="peer-select"><option value="">Select peer</option></select>
+    <input id="chat-input" type="text" placeholder="Type a message">
+  </div>
+  <div>
+    <button id="send-btn" type="button">Send</button>
+    <button id="broadcast-btn" type="button">Broadcast</button>
+    <button id="load-msg-btn" type="button">Load Messages</button>
+  </div>
+  <ul id="message-list"></ul>
+</main>
+<script src="/js/api.js"></script>
+<script src="/js/app.js"></script>
+<script src="/js/chat.js"></script>
 </body>
 </html>

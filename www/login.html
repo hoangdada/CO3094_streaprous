@@ -1,8 +1,21 @@
-<html><body>
-<h1>Login</h1>
-<form method="POST" action="/login">
-  Username: <input name="username" type="text"><br>
-  Password: <input name="password" type="password"><br>
-  <input type="submit" value="Login">
-</form>
-</body></html>
+<!doctype html>
+<html>
+<head>
+  <title>bksysnet@hcmut login</title>
+  <link rel="stylesheet" href="/css/styles.css">
+</head>
+
+<body>
+<main>
+  <h1>bksysnet@hcmut - Loginpage</h1>
+  <form id="login-form">
+    <div><label for="username">Username:</label> <input id="username" name="username" type="text"></div>
+    <div><label for="password">Password:</label> <input id="password" name="password" type="password"></div>
+    <button id="login-btn" type="submit">Login</button>
+  </form>
+  <p id="login-message"></p>
+</main>
+<script src="/js/api.js"></script>
+<script src="/js/login.js"></script>
+</body>
+</html>
