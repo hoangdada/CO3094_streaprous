@@ -9,8 +9,9 @@ from functools import wraps
 from daemon import StreapRous
 
 credentials = {
-    "alice": "password123",
-    "bob": "password456"
+    "alice": "123",
+    "bob": "456",
+    "charlie":"789"
 }
 
 sessions = {}
